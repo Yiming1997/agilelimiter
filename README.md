@@ -20,7 +20,7 @@ downstream RTT ──> histogram (p50/p99) ──> fast/slow EWMA ──> rate f
 | `bucket.go` | Simplest leaky bucket; `setRate` hot-updates the rate. |
 | `histogram.go` | Lock-free log-bucketed histogram (p50/p99), reset each tick. |
 | `controller.go` | Fast/slow EWMA baseline + gradient decrease / additive increase + p99 guard. |
-| `limiter.go` | `Config`, `New`, `Take`, `Observe`, `Do`, `Rate`, `Stats`, `Start`, `Stop`. |
+| `limiter.go` | `Config`, `New`, `Do` (and the generic `Do[T]`), the lower-level `Take`/`Observe`, `Rate`, `Stats`, `Start`, `Stop`. |
 | `semaphore.go` | Concurrency actuator for inbound limiting; non-blocking `tryAcquire`. |
 | `concurrency.go` | `ConcurrencyConfig`, `NewConcurrency`, `TryTake`, `Release`, `Do`, `Limit`. |
 | `httpserver/httpserver.go` | `net/http` middleware: shed with 429, feed handler latency back. |
@@ -44,25 +44,47 @@ lim := agilelimiter.New(agilelimiter.Config{
 lim.Start()
 defer lim.Stop()
 
-// Hot path:
-t0 := lim.Take()                 // blocks until allowed; returns planned send time
-start := time.Now()
-resp, err := doRequest(ctx)      // talk to the downstream
-_ = resp
-lim.Observe(time.Since(start))   // downstream RTT -> drives the controller
-_ = t0                          // t0 - start gives a CO-safe end-to-end metric
+// Hot path: wrap the downstream call in Do. It takes a slot, times the call, and
+// feeds the measured round-trip time back to the controller — you never touch
+// Take/Observe, so you cannot feed it the wrong latency.
+err := lim.Do(func() error { return doRequest(ctx) })
 ```
+
+When the call returns a value, use the generic form:
+
+```go
+resp, err := agilelimiter.Do(lim, func() (*http.Response, error) {
+	return client.Do(req)
+})
+```
+
+`Do` observes the round trip even when `fn` returns an error: a timeout is a real
+signal that the downstream is struggling, so it still moves the controller.
 
 ## The one rule that matters: measure the right latency
 
-`Observe` **must** be given the *downstream* round-trip time — measured from the
-moment the request was **actually sent**, not from the moment it was planned.
+The signal the controller wants is the *downstream* round-trip time — measured
+from the moment the request was **actually sent**, not from the moment it was
+planned. `Do` gets this right for you: it starts its clock the instant the slot
+is granted, so what it feeds the controller is exactly that round trip.
 
 If you instead feed end-to-end latency that includes this limiter's own throttle
 wait, you create a self-reinforcing loop: backing off raises the measured
 latency, which triggers more backing off, which collapses the rate to `MinRate`.
-Use the planned-send timestamp returned by `Take()` only for a
-coordinated-omission-safe *reporting* metric.
+`Do` is the default precisely because it removes that footgun. Reach for the
+manual `Take`/`Observe` pair only when `Do` cannot measure the round trip — for
+an async send, or a call that retries internally, where the value must be one
+attempt's real round trip rather than the wrapper's. When you do, feed `Observe`
+the downstream RTT and keep `Take`'s planned-send timestamp for a
+coordinated-omission-safe *reporting* metric only:
+
+```go
+t0 := lim.Take()               // planned send time (blocks until granted)
+start := time.Now()            // actually sent
+err := doRequest(ctx)
+lim.Observe(time.Since(start)) // downstream RTT -> drives the controller
+report(time.Since(t0))         // CO-safe end-to-end metric -> reporting only
+```
 
 ## How the controller decides
 
@@ -112,24 +134,28 @@ lim := agilelimiter.NewConcurrency(agilelimiter.ConcurrencyConfig{
 lim.Start()
 defer lim.Stop()
 
-// Hot path — non-blocking admission:
-if !lim.TryTake() {
-	http.Error(w, "overloaded", http.StatusTooManyRequests)
-	return
-}
-defer lim.Release()
-start := time.Now()
-handle(w, r)
-lim.Observe(time.Since(start)) // this request's handling time -> drives the controller
-```
-
-Or let `Do` do all of it, returning `ErrOverloaded` when the limit is reached:
-
-```go
+// Hot path: Do admits the request if there is room, times the handler, and feeds
+// the handling time back to the controller. At the limit it returns
+// ErrOverloaded at once — refusing, not queuing.
 err := lim.Do(func() error { return handle(w, r) })
 if errors.Is(err, agilelimiter.ErrOverloaded) {
 	http.Error(w, "overloaded", http.StatusTooManyRequests)
 }
+```
+
+When the slot must span more than one call, or you want to release it yourself,
+drive the primitives directly. Every successful `TryTake` must be paired with
+exactly one `Release`:
+
+```go
+if !lim.TryTake() {
+	http.Error(w, "overloaded", http.StatusTooManyRequests)
+	return
+}
+defer lim.Release()            // released even if the handler panics
+start := time.Now()
+handle(w, r)
+lim.Observe(time.Since(start)) // this request's handling time -> drives the controller
 ```
 
 `Limit()` returns the current concurrency limit and `InFlight()` the number of
@@ -174,8 +200,8 @@ saturated.
   and the controller freezes in the overloaded state. This implementation avoids
   it by updating the baseline *asymmetrically* — it falls quickly, rises slowly.
 - **Coordinated omission.** In the measurement path, never stop sampling when the
-  downstream slows. If your workers block and stop calling `Take`, you go blind
-  exactly when it matters most. Measure from the planned send time.
+  downstream slows. If your workers block and stop issuing calls, you go blind
+  exactly when it matters most — a stalled caller produces no sample at all.
 - **Oscillation.** If the rate rings, lengthen the half-lives, increase
   `Deadband`, shrink `UpStep`, or lower `Gain`.
 - **Observability.** Export `Rate()`, the baseline, and the current p50/p99.

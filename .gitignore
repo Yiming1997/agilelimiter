@@ -1,0 +1,8 @@
+# Compiled binaries — `go build ./...` drops the executable into the package dir
+# (the compare module's package is `main`, so it emits ./compare/compare).
+/compare/compare
+
+# Temp leftovers from `gofmt -w` / `go run` on mounted filesystems where the
+# temp-file rename-over fails and the temp file is left behind.
+*.go.[0-9]*
+*-go-tmp-*

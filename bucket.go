@@ -16,7 +16,7 @@ type Clock interface {
 // realClock is the default Clock backed by the standard library.
 type realClock struct{}
 
-func (realClock) Now() time.Time { return time.Now() }
+func (realClock) Now() time.Time        { return time.Now() }
 func (realClock) Sleep(d time.Duration) { time.Sleep(d) }
 
 // bucket is the simplest possible leaky bucket, used purely as the actuator.

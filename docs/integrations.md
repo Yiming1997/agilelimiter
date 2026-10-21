@@ -138,6 +138,17 @@ func UnaryServer(lim *agilelimiter.Limiter) grpc.UnaryServerInterceptor {
 
 **5.3 错误 vs 延迟的显式策略（两个方向都必需）。** 「快速失败」不计入延迟信号——一个立刻返回的错误（连接被拒、立即 5xx / `Unavailable`、`ctx` 取消）会让 `Observe` 记到接近 0 的值，于是下游/本服务显得**健康**，控制器**加速**，与意图相反。需要一条明确规则：**没有拿到真实响应时，要么跳过 `Observe`，要么喂一个合成的「坏」值**，绝不能喂接近 0 的延迟。这一条 `design.md §5` 的「错误/超时兜底」其实已经点到，但**还没有落到 API 上**。
 
+> 已于本轮落地：判据不是「有没有 err」而是「**有没有到达下游**」。新增
+> `Outcome{Reached, Unreachable, Aborted}` 与 `Config.Classify(error) Outcome`
+> （`ConcurrencyConfig` 同款），以及手动路径上的 `Unavailable()`。默认行为不变
+> （所有错误按 `Reached` 处理，即喂真实 RTT）；把「连接被拒 / DNS 失败 / 熔断打开」
+> 判为 `Unreachable` 时，改为喂一条 ≥ `SLOTarget` 的合成样本，让控制器退到
+> `MinRate`/`MinLimit` 继续探活。实测：下游每调用必拒时，默认策略 10s 内把速率从
+> 50 抬到 335（危险），分类后 10s 内退到 20（= `MinRate`），恢复后重新爬升。
+> 尚未落地的是 5.1 的 `httpserver` 版本（中间件目前对所有被接纳请求一律 `Observe`，
+> 需要在 `Wrap` 里捕获状态码才能按 503 分类，涉及包装 `ResponseWriter`，
+> 会牵动 streaming 处理器，单独做）。
+
 ---
 
 ## 6. 横切关注点

@@ -24,6 +24,7 @@ downstream RTT ──> histogram (p50/p99) ──> fast/slow EWMA ──> rate f
 | `semaphore.go` | Concurrency actuator for inbound limiting; non-blocking `tryAcquire`. |
 | `concurrency.go` | `ConcurrencyConfig`, `NewConcurrency`, `TryTake`, `Release`, `Do`, `Limit`. |
 | `httpserver/httpserver.go` | `net/http` middleware: shed with 429, feed handler latency back. |
+| `httpclient/httpclient.go` | `http.RoundTripper`: pace outbound HTTP, keep cache hits out of the signal. |
 | `limiter_test.go` | Deterministic tests (virtual clock). |
 | `concurrency_test.go` | Deterministic tests for the concurrency limiter. |
 | `httpserver/httpserver_test.go` | `httptest`-based tests for the middleware. |
@@ -85,6 +86,112 @@ err := doRequest(ctx)
 lim.Observe(time.Since(start)) // downstream RTT -> drives the controller
 report(time.Since(t0))         // CO-safe end-to-end metric -> reporting only
 ```
+
+## When the downstream is down: classify failures by "did it reach?"
+
+A failure is **not** automatically a congestion signal, and getting this wrong
+makes the limiter actively harmful. A refused connection returns in microseconds;
+the controller reads that as "the downstream is fast and healthy" and raises the
+rate into a dependency that is already down. Measured: starting at 50 req/s
+against a port that refuses every call, the rate climbed to **335 req/s in ten
+seconds** — and kept going.
+
+The question that matters is not "did it fail?" but "did it reach the
+downstream?". Say so once at the boundary:
+
+```go
+lim := agilelimiter.New(agilelimiter.Config{
+	MinRate:   20,
+	MaxRate:   500,
+	SLOTarget: 200 * time.Millisecond,
+	Classify: func(err error) agilelimiter.Outcome {
+		switch {
+		case errors.Is(err, syscall.ECONNREFUSED), errors.Is(err, errBreakerOpen):
+			return agilelimiter.Unreachable // never arrived
+		case errors.Is(err, context.Canceled):
+			return agilelimiter.Aborted // not the downstream's opinion
+		default:
+			return agilelimiter.Reached // timeout, 5xx: it answered
+		}
+	},
+})
+```
+
+| `Outcome` | When | What the controller is told |
+|---|---|---|
+| `Reached` | it reached the downstream and came back — 2xx, 5xx, timeout | the measured round trip, as usual |
+| `Unreachable` | it never arrived — refused, DNS, TLS, open breaker | a synthetic "congested" sample, so it backs off toward `MinRate` |
+| `Aborted` | the caller gave up, or the call never started | nothing |
+
+Details that matter:
+
+- **The default is `Reached` for every error** (i.e. today's behaviour), so this
+  is opt-in. It is right for anything the downstream answered; it is wrong only
+  for calls that never arrived, and only you can tell the difference.
+- The synthetic sample is placed above the tolerated window and above
+  `SLOTarget`, so the proportional backoff *and* the p99 tail guard both fire.
+  It is a no-op before there is anything to anchor against (no `SLOTarget`, no
+  sample yet) — inventing a baseline value would be worse than staying silent.
+- **`MinRate` is the outage probe rate.** Backing off to 20 req/s is how the
+  limiter keeps testing whether the downstream came back. Make sure it is a rate
+  the downstream can absorb (× your instance count).
+- On the manual `Take`/`Observe` path, call `lim.Unavailable()` instead of
+  `Observe` for that attempt. Never both — that records two samples for one call.
+- `ConcurrencyLimiter` has the same options, for handlers that answer 503 without
+  doing any work: `Config.Classify` and `lim.Unavailable()`.
+
+Pair this with a circuit breaker. The breaker decides "stop calling"; the limiter
+decides "how much of the remaining capacity to use". Without a breaker you still
+pay a full network timeout on every call while the limiter sits at `MinRate`.
+
+## Downstream caches: don't let hits drive the controller
+
+A cache in front of a downstream splits its traffic into two populations sharing
+one pipe: a hit answers in ~1ms and consumes none of the origin's capacity, a
+miss costs whatever the origin costs. Feed both into one p50 and the controller
+tracks the cache's hit ratio instead of the origin's load. Measured
+(`compare/cache_test.go`, 95% hits, origin saturated):
+
+| | overall SLO | requests that reached the origin | origin p99 |
+|---|---:|---:|---:|
+| observe everything | **98.9%** | **79%** | **369ms** |
+| observe misses only | 100% | 100% | 278ms |
+
+The aggregate was green while the origin was timing out. So route hits past the
+controller:
+
+```go
+client := &http.Client{
+	Transport: httpclient.Wrap(http.DefaultTransport, lim),
+}
+```
+
+`Wrap` takes a slot, measures the round trip, and skips the observation for a
+response that `IsCacheHit` recognises — `Age > 0` (RFC 7234), or a `HIT` in
+`X-Cache` / `X-Proxy-Cache` / `CF-Cache-Status`. Errors still go through
+`Config.Classify`. Use `httpclient.WithCacheHit(fn)` for another signal.
+
+A **429 or any 5xx** is handled the same way as a refused connection: it is not a
+Go error, so by default it would be recorded as a fast healthy round trip, and
+the controller would accelerate into the service that just said "no". `Wrap`
+reports those as an outage and backs off. `httpclient.WithErrorStatus(codes...)`
+replaces that set; pass an empty list to observe every status.
+
+Two things this does **not** do:
+
+- **It does not raise the ceiling for hits.** A hit still takes a slot, because
+  the caller cannot know a request will hit before sending it. To give hits a
+  higher ceiling, split them onto a second limiter where a local cache already
+  tells you the answer.
+- **It does not stop a cold cache from stampeding the origin.** That is a step
+  change, and an adaptive limiter is a lagging controller. Coalesce misses
+  (single-flight so one fill serves many), size `MaxRate` for a **cold** origin,
+  and keep a small cache-bypassing probe feeding the controller so the origin's
+  real latency stays observable.
+
+If the cache is yours (in-process, or Redis you query yourself), do not classify
+anything: put the limiter around the call that actually costs capacity — the
+cache hit never reaches it, so it never produces a sample.
 
 ## How the controller decides
 
@@ -193,19 +300,55 @@ measured. `Wrap` releases the slot even if the handler panics, and
 mount it *outside* the wrapper so it stays readable while the service is
 saturated.
 
+#### What the middleware does *not* observe
+
+A handler that fails instantly reports a ~0 handling time, which would otherwise
+read as "this service is fast and healthy" and raise the limit. So the response
+is inspected before it is measured:
+
+| Response | Treated as | Why |
+|---|---|---|
+| 429, 502, 503, 504 | outage → back off | "cannot serve right now" |
+| 500, 501, other 5xx | a normal round trip | "your code has a bug" — backing off fixes nothing and would turn a failing endpoint into a smaller failing endpoint |
+| a cache hit (`Age > 0`, `X-Cache: HIT`, …) | not observed at all | a cheap path says nothing about how much of the real capacity is left |
+
+```go
+httpserver.Wrap(mux, lim,
+	httpserver.WithErrorStatus(429, 503),                 // narrow the set
+	httpserver.WithCacheHit(func(h http.Header) bool {    // your own signal
+		return h.Get("X-Served-From") == "cache"
+	}))
+```
+
+`IsCacheHit` reads only headers your handler already wrote, so marking a cache
+hit is one line: `w.Header().Set("X-Cache", "HIT")` before the body. The same
+reasoning as the outbound side applies — with 95% of requests served from memory
+in 0.2ms, p50 tracks the cache, not the 5% that reach the database.
+
 ## Pitfalls (read before tuning)
 
 - **Baseline pollution.** If the slow EWMA is allowed to rise freely, a long
-  overload drags the baseline up to the congested latency, `ratio` returns to 1,
-  and the controller freezes in the overloaded state. This implementation avoids
-  it by updating the baseline *asymmetrically* — it falls quickly, rises slowly.
+  overload drags the baseline up to the congested latency, the tolerated window
+  rises with it, and the controller freezes in the overloaded state. This implementation avoids
+  it two ways: the baseline is updated *asymmetrically* (falls quickly, rises
+  slowly) and its upward drift is hard-capped per tick by `MaxBaselineRise`, so a
+  sustained overload cannot move the target at all.
+- **Fast failures look like health.** A connection that is refused, a DNS
+  failure, an open breaker: all return in microseconds, which the controller
+  reads as a fast response and answers by raising the rate. Classify them as
+  `Unreachable` (see above). This is the one mistake that makes the limiter
+  actively harmful rather than merely suboptimal.
 - **Coordinated omission.** In the measurement path, never stop sampling when the
   downstream slows. If your workers block and stop issuing calls, you go blind
   exactly when it matters most — a stalled caller produces no sample at all.
 - **Oscillation.** If the rate rings, lengthen the half-lives, increase
   `Deadband`, shrink `UpStep`, or lower `Gain`.
-- **Observability.** Export `Rate()`, the baseline, and the current p50/p99.
-  An adaptive limiter you cannot see into is one you cannot debug.
+- **Observability.** Export `Rate()`, `Stats()` (baseline, fast, the last tick's
+  p50/p99) — and `Stats().Samples` above all: with no samples a step changes
+  nothing, so a *frozen* rate and a *steady* one look identical. Alert on
+  `Samples == 0` for more than a few ticks; it is what tells you the controller
+  went blind (low traffic, or a pipeline that stopped observing because every
+  response was a cache hit).
 
 ## Testing
 

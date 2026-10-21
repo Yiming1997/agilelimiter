@@ -35,6 +35,10 @@ type ConcurrencyConfig struct {
 	SlowHalfLife     time.Duration // healthy baseline (creeps up slowly)
 	SlowDownHalfLife time.Duration // baseline follows improvements down
 
+	// MaxBaselineRise caps how fast the healthy baseline may creep upward, as a
+	// fraction per tick. Zero takes the default. See Config.MaxBaselineRise.
+	MaxBaselineRise float64
+
 	// Tick is the control-loop period.
 	Tick time.Duration
 
@@ -49,6 +53,17 @@ type ConcurrencyConfig struct {
 	DownStep float64
 	// Deadband is the hold band around the target latency, as a fraction of it.
 	Deadband float64
+
+	// Classify maps a failed request to what the controller is told about it. It
+	// is only consulted for non-nil errors; a nil error always means Reached.
+	//
+	// The default (nil) treats every error as Reached. That is wrong for a
+	// handler that fails without doing any work — a cached 503 while a dependency
+	// is down, an auth rejection, a circuit breaker returning early. Its handling
+	// time is ~0, the controller reads it as "this service is fast", and it raises
+	// the limit while the service is actually degrading. Return Unreachable for
+	// those; return Aborted for client-side cancellations.
+	Classify func(err error) Outcome
 
 	// Clock defaults to the real clock. Inject a fake one in tests.
 	Clock Clock
@@ -73,9 +88,10 @@ type ConcurrencyLimiter struct {
 	hist *histogram
 	ctrl *controller
 
-	stopOnce sync.Once
-	stop     chan struct{}
-	wg       sync.WaitGroup
+	startOnce sync.Once
+	stopOnce  sync.Once
+	stop      chan struct{}
+	wg        sync.WaitGroup
 }
 
 // NewConcurrency builds a ConcurrencyLimiter. It does not start the control loop;
@@ -94,12 +110,14 @@ func NewConcurrency(cc ConcurrencyConfig) *ConcurrencyLimiter {
 		FastHalfLife:     cc.FastHalfLife,
 		SlowHalfLife:     cc.SlowHalfLife,
 		SlowDownHalfLife: cc.SlowDownHalfLife,
+		MaxBaselineRise:  cc.MaxBaselineRise,
 		Tick:             cc.Tick,
 		TargetInflation:  cc.TargetInflation,
 		Gain:             cc.Gain,
 		UpStep:           cc.UpStep,
 		DownStep:         cc.DownStep,
 		Deadband:         cc.Deadband,
+		Classify:         cc.Classify,
 		Clock:            cc.Clock,
 	})
 
@@ -131,12 +149,17 @@ func (l *ConcurrencyLimiter) Release() { l.sem.release() }
 // concurrent use and allocation-free.
 func (l *ConcurrencyLimiter) Observe(d time.Duration) { l.hist.record(d) }
 
-// Do admits a request if there is room and runs fn, observing fn's duration;
-// when the limit is reached it returns ErrOverloaded without running fn. The slot
-// is released even if fn panics.
+// Do admits a request if there is room and runs fn, observing fn's outcome; when
+// the limit is reached it returns ErrOverloaded without running fn. The slot is
+// released even if fn panics.
 //
 //	resp, err := do(...)
 //	if errors.Is(err, ErrOverloaded) { http.Error(w, "overloaded", 429); return }
+//
+// As with Limiter.Do, Config.Classify decides what a failure tells the
+// controller. By default a failed handler is still observed as an ordinary
+// handling time; classify the "failed without doing any work" errors as
+// Unreachable so they cannot pass for a fast, healthy handler.
 func (l *ConcurrencyLimiter) Do(fn func() error) error {
 	if !l.sem.tryAcquire() {
 		return ErrOverloaded
@@ -144,8 +167,54 @@ func (l *ConcurrencyLimiter) Do(fn func() error) error {
 	start := l.cfg.Clock.Now()
 	defer l.sem.release()
 	err := fn()
-	l.Observe(l.cfg.Clock.Now().Sub(start))
+	l.observeOutcome(l.cfg.Clock.Now().Sub(start), err)
 	return err
+}
+
+// observeOutcome tells the controller what a request's result says about the
+// service. See Limiter.observeOutcome and Outcome.
+func (l *ConcurrencyLimiter) observeOutcome(d time.Duration, err error) {
+	out := Reached
+	if err != nil && l.cfg.Classify != nil {
+		out = l.cfg.Classify(err)
+	}
+	switch {
+	case out == Unreachable:
+		l.Unavailable()
+	case out == Aborted:
+		// Nothing: the service never expressed an opinion.
+	default:
+		l.hist.record(d)
+	}
+}
+
+// Unavailable records one request that failed without the service doing any
+// work — a dependency is down and the handler answers 503 immediately, a circuit
+// breaker is open, a request is rejected before touching the hot path. Record it
+// instead of Observe for that request: its handling time is ~0 and would read as
+// a fast, healthy service, so the controller would raise the limit while the
+// service is struggling. It feeds a synthetic "congested" sample that backs the
+// limit off toward MinLimit.
+//
+// It is a no-op before the controller has anything to anchor a synthetic value
+// against: with no SLOTarget and no samples yet there is no honest number to
+// record, and inventing one would corrupt the baseline.
+//
+// Use this from the manual TryTake/Observe path, or return Unreachable from
+// Config.Classify to have Do call it for you. Never do both for the same
+// request.
+func (l *ConcurrencyLimiter) Unavailable() {
+	if s, ok := l.ctrl.outageSample(); ok {
+		l.hist.record(s)
+	}
+}
+
+// ObserveOutcome records how one request ended, applying Config.Classify to the
+// error. Use it from an integration that admits, times and classifies requests
+// itself, so the error policy stays in one place. It is exactly what Do does
+// with the same two values.
+func (l *ConcurrencyLimiter) ObserveOutcome(d time.Duration, err error) {
+	l.observeOutcome(d, err)
 }
 
 // Limit returns the current concurrency limit, in requests.
@@ -158,22 +227,26 @@ func (l *ConcurrencyLimiter) InFlight() int { return l.sem.inFlight() }
 // concurrency limiter, the Rate field holds the current limit, not a rate.
 func (l *ConcurrencyLimiter) Stats() Stats { return l.ctrl.stats() }
 
-// Start launches the control loop in the background.
+// Start launches the control loop in the background. Calling it more than once
+// is a no-op: a second loop would double the step rate, and since every gain in
+// the control law is a per-tick increment, that silently doubles them too.
 func (l *ConcurrencyLimiter) Start() {
-	l.wg.Add(1)
-	go func() {
-		defer l.wg.Done()
-		t := time.NewTicker(l.cfg.Tick)
-		defer t.Stop()
-		for {
-			select {
-			case <-l.stop:
-				return
-			case <-t.C:
-				l.ctrl.step()
+	l.startOnce.Do(func() {
+		l.wg.Add(1)
+		go func() {
+			defer l.wg.Done()
+			t := time.NewTicker(l.cfg.Tick)
+			defer t.Stop()
+			for {
+				select {
+				case <-l.stop:
+					return
+				case <-t.C:
+					l.ctrl.step()
+				}
 			}
-		}
-	}()
+		}()
+	})
 }
 
 // Stop halts the control loop. Safe to call more than once.

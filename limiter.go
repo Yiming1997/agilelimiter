@@ -1,6 +1,8 @@
 package agilelimiter
 
 import (
+	"context"
+	"errors"
 	"sync"
 	"time"
 )
@@ -228,10 +230,24 @@ func Do[T any](l *Limiter, fn func() (T, error)) (T, error) {
 	return v, err
 }
 
+// defaultOutcome is what the controller is told when Config.Classify is nil.
+//
+// A canceled call is the one failure the library can classify on its own: the
+// caller gave up, the downstream never answered, and the truncated round trip
+// would otherwise be recorded as a suspiciously fast success. DeadlineExceeded
+// is deliberately NOT included — that one means the downstream was too slow,
+// which is a real signal and must be observed.
+func defaultOutcome(err error) Outcome {
+	if err != nil && errors.Is(err, context.Canceled) {
+		return Aborted
+	}
+	return Reached
+}
+
 // observeOutcome tells the controller what a call's result says about the
 // downstream. See Outcome for why the error alone is not the question.
 func (l *Limiter) observeOutcome(d time.Duration, err error) {
-	out := Reached
+	out := defaultOutcome(err)
 	if err != nil && l.cfg.Classify != nil {
 		out = l.cfg.Classify(err)
 	}

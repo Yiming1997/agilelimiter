@@ -97,7 +97,9 @@ against a port that refuses every call, the rate climbed to **335 req/s in ten
 seconds** — and kept going.
 
 The question that matters is not "did it fail?" but "did it reach the
-downstream?". Say so once at the boundary:
+downstream?". Say so once at the boundary — `Do`/`Do[T]` take `Config.Classify`;
+the HTTP adapters take a `Verdict` (`httpclient`/`httpserver` below), and each
+call path has exactly one of the two:
 
 ```go
 lim := agilelimiter.New(agilelimiter.Config{
@@ -166,16 +168,49 @@ client := &http.Client{
 }
 ```
 
-`Wrap` takes a slot, measures the round trip, and skips the observation for a
-response that `IsCacheHit` recognises — `Age > 0` (RFC 7234), or a `HIT` in
-`X-Cache` / `X-Proxy-Cache` / `CF-Cache-Status`. Errors still go through
-`Config.Classify`. Use `httpclient.WithCacheHit(fn)` for another signal.
+`Wrap` takes a slot, measures the round trip, and hands the result to a
+`Verdict`: one function, called once per call, returning one of three answers.
 
-A **429 or any 5xx** is handled the same way as a refused connection: it is not a
-Go error, so by default it would be recorded as a fast healthy round trip, and
-the controller would accelerate into the service that just said "no". `Wrap`
-reports those as an outage and backs off. `httpclient.WithErrorStatus(codes...)`
-replaces that set; pass an empty list to observe every status.
+```go
+type Verdict func(resp *http.Response, err error, d time.Duration) agilelimiter.Outcome
+
+client := &http.Client{
+	Transport: httpclient.Wrap(http.DefaultTransport, lim,
+		httpclient.WithVerdict(myVerdict)),
+}
+```
+
+That is the whole policy surface. There is no option per case, because the cases
+are not enumerable: a new proxy header, a new async endpoint, a circuit-breaker
+fallback — each is a line in your function, not a release of this library.
+
+`DefaultVerdict` is what you get without one. It is small enough to read:
+
+| result | answer | why |
+|---|---|---|
+| `context.Canceled` | `Aborted` | the caller gave up; the duration is truncated, not fast |
+| a `*net.OpError` with `Op == "dial"` | `Unreachable` | refused, DNS, no route, connect timeout: nothing was sent |
+| any other error | `Reached` | a timeout is a real signal |
+| 429, any 5xx | `Unreachable` | "do not send more" — from outside you cannot tell a bug from overload, and sending less is kind either way |
+| cache hit | `Aborted` | `Age > 0`, or a `HIT` in `X-Cache` / `X-Proxy-Cache` / `CF-Cache-Status` |
+| anything else | `Reached` | |
+
+Copy it and add the cases you know about. Two it deliberately leaves to you:
+
+```go
+case errors.Is(err, ErrBreakerOpen):
+	return agilelimiter.Unreachable   // your own error, not a *net.OpError
+case resp.StatusCode == http.StatusAccepted:
+	return agilelimiter.Aborted       // the work has not happened yet
+```
+
+A custom verdict replaces `DefaultVerdict` entirely — `Wrap` does not consult
+`Config.Classify` (that one is for `Do`/`Do[T]`, so each call path has exactly one
+policy entry point).
+
+One thing a verdict **cannot** change: a canceled call is dropped by `Wrap` before
+the verdict runs. It is a truncated measurement, not a fast response, so a verdict
+that returns `Reached` for everything still cannot turn it into evidence.
 
 Two things this does **not** do:
 
@@ -306,24 +341,50 @@ A handler that fails instantly reports a ~0 handling time, which would otherwise
 read as "this service is fast and healthy" and raise the limit. So the response
 is inspected before it is measured:
 
-| Response | Treated as | Why |
-|---|---|---|
-| 429, 502, 503, 504 | outage → back off | "cannot serve right now" |
-| 500, 501, other 5xx | a normal round trip | "your code has a bug" — backing off fixes nothing and would turn a failing endpoint into a smaller failing endpoint |
-| a cache hit (`Age > 0`, `X-Cache: HIT`, …) | not observed at all | a cheap path says nothing about how much of the real capacity is left |
+#### What the middleware records, and what you tell it
+
+Same one-hook design as the outbound side:
 
 ```go
-httpserver.Wrap(mux, lim,
-	httpserver.WithErrorStatus(429, 503),                 // narrow the set
-	httpserver.WithCacheHit(func(h http.Header) bool {    // your own signal
-		return h.Get("X-Served-From") == "cache"
+type Verdict func(r *http.Request, status int, h http.Header, d time.Duration) agilelimiter.Outcome
+```
+
+`DefaultVerdict` gives you:
+
+| Response | Treated as | Why |
+|---|---|---|
+| request context canceled | not observed | the client went away; the handler returned early because nobody is listening |
+| 429, 502, 503, 504 | outage → back off | "cannot serve right now" |
+| 500, 501, other 5xx | a normal round trip | "your code has a bug" — backing off fixes nothing |
+| a cache hit (`Age > 0`, `X-Cache: HIT`, …) | not observed at all | a cheap path says nothing about remaining capacity |
+
+Everything else is your call, in one function:
+
+```go
+httpserver.Wrap(mux, lim, httpserver.WithVerdict(
+	func(r *http.Request, status int, h http.Header, d time.Duration) agilelimiter.Outcome {
+		switch {
+		case strings.HasPrefix(r.URL.Path, "/health"), r.URL.Path == "/metrics":
+			return agilelimiter.Aborted // cheap by design, and noisy on a quiet service
+		case r.Method == http.MethodOptions:
+			return agilelimiter.Aborted // CORS preflight
+		case httpserver.IsCacheHitHeader(h):
+			return agilelimiter.Aborted
+		default:
+			return httpserver.DefaultVerdict(r, status, h, d)
+		}
 	}))
 ```
 
-`IsCacheHit` reads only headers your handler already wrote, so marking a cache
+`IsCacheHitHeader` reads only headers your handler already wrote, so marking a cache
 hit is one line: `w.Header().Set("X-Cache", "HIT")` before the body. The same
 reasoning as the outbound side applies — with 95% of requests served from memory
 in 0.2ms, p50 tracks the cache, not the 5% that reach the database.
+
+Two cases the default does not handle, because they need knowledge it does not
+have: **health/metrics/preflight** (exclude by path, as above) and **long-lived
+streams** (SSE, websocket, long poll — give them their own budget, or the median
+of every other request pays for them).
 
 ## Pitfalls (read before tuning)
 

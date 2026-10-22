@@ -1,6 +1,7 @@
 package agilelimiter
 
 import (
+	"context"
 	"errors"
 	"testing"
 	"time"
@@ -129,5 +130,39 @@ func TestConcurrencyUnreachableBacksOffTowardMinLimit(t *testing.T) {
 	}
 	if got := l.Limit(); got != 2 {
 		t.Fatalf("an unreachable dependency must back the limit off to MinLimit, got %v", got)
+	}
+}
+
+// A canceled call is the one failure the library classifies without help: the
+// caller gave up, so the truncated duration is not a statement about the
+// downstream. A timeout is the opposite and must still be observed.
+func TestCanceledCallTellsTheControllerNothing(t *testing.T) {
+	l := New(Config{MinRate: 10, MaxRate: 1000, InitialRate: 100})
+	if err := l.Do(func() error { return context.Canceled }); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Do returned %v", err)
+	}
+	if _, _, n := l.hist.snapshot(); n != 0 {
+		t.Fatalf("recorded %d samples for a canceled call, want 0", n)
+	}
+}
+
+func TestDeadlineExceededIsStillObserved(t *testing.T) {
+	l := New(Config{MinRate: 10, MaxRate: 1000, InitialRate: 100})
+	l.Do(func() error { return context.DeadlineExceeded })
+	if _, _, n := l.hist.snapshot(); n != 1 {
+		t.Fatalf("recorded %d samples for a timeout, want 1: a timeout is a real signal", n)
+	}
+}
+
+// The built-in default is overridable: someone who wants cancellations counted
+// can say so with Classify.
+func TestClassifyOverridesTheCanceledDefault(t *testing.T) {
+	l := New(Config{
+		MinRate: 10, MaxRate: 1000, InitialRate: 100,
+		Classify: func(error) Outcome { return Reached },
+	})
+	l.Do(func() error { return context.Canceled })
+	if _, _, n := l.hist.snapshot(); n != 1 {
+		t.Fatalf("recorded %d samples, want 1: Classify must win over the default", n)
 	}
 }

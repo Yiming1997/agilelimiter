@@ -1,6 +1,7 @@
 package httpserver
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -240,13 +241,48 @@ func TestBugStatusIsObservedNormally(t *testing.T) {
 	}
 }
 
-func TestWithErrorStatusOverride(t *testing.T) {
+// The default is a pure function, so its rules are testable without a limiter.
+func TestDefaultVerdictRules(t *testing.T) {
+	ok := httptest.NewRequest(http.MethodGet, "/x", nil)
+	canceled := ok.Clone(context.Background())
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	canceled = canceled.WithContext(ctx)
+
+	hit := http.Header{"X-Cache": {"HIT"}}
+	cases := []struct {
+		name   string
+		r      *http.Request
+		status int
+		h      http.Header
+		want   agilelimiter.Outcome
+	}{
+		{"200 observed", ok, 200, http.Header{}, agilelimiter.Reached},
+		{"500 observed (a bug is not capacity)", ok, 500, http.Header{}, agilelimiter.Reached},
+		{"503 backs off", ok, 503, http.Header{}, agilelimiter.Unreachable},
+		{"429 backs off", ok, 429, http.Header{}, agilelimiter.Unreachable},
+		{"404 observed", ok, 404, http.Header{}, agilelimiter.Reached},
+		{"cache hit skipped", ok, 200, hit, agilelimiter.Aborted},
+		{"canceled request skipped", canceled, 200, http.Header{}, agilelimiter.Aborted},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := DefaultVerdict(c.r, c.status, c.h, time.Millisecond); got != c.want {
+				t.Fatalf("DefaultVerdict = %v, want %v", got, c.want)
+			}
+		})
+	}
+}
+
+func TestVerdictCanDisableStatusBackoff(t *testing.T) {
 	lim := newFastLimiter(t)
-	// An empty set disables status-based backoff entirely.
-	driveFor(t, Wrap(fastHandler(http.StatusServiceUnavailable), lim, WithErrorStatus()),
+	v := func(*http.Request, int, http.Header, time.Duration) agilelimiter.Outcome {
+		return agilelimiter.Reached
+	}
+	driveFor(t, Wrap(fastHandler(http.StatusServiceUnavailable), lim, WithVerdict(v)),
 		300*time.Millisecond)
 	if got := lim.Limit(); got < 150 {
-		t.Fatalf("limit %d fell with status backoff disabled", got)
+		t.Fatalf("limit %d fell with a verdict that observes everything", got)
 	}
 }
 
@@ -278,16 +314,20 @@ func TestCacheHitIsNotObserved(t *testing.T) {
 	}
 }
 
-func TestWithCacheHitOverride(t *testing.T) {
+// A custom verdict can override the default's cache-hit skip: one function is the
+// whole policy surface.
+func TestVerdictCanOverrideCacheSkip(t *testing.T) {
 	lim := newFastLimiter(t)
 	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Cache", "HIT")
 		time.Sleep(time.Millisecond)
 	})
-	driveFor(t, Wrap(h, lim, WithCacheHit(func(http.Header) bool { return false })),
-		300*time.Millisecond)
+	v := func(*http.Request, int, http.Header, time.Duration) agilelimiter.Outcome {
+		return agilelimiter.Reached
+	}
+	driveFor(t, Wrap(h, lim, WithVerdict(v)), 300*time.Millisecond)
 	if got := lim.Limit(); got <= 100 {
-		t.Fatalf("limit %d did not climb with the hit predicate disabled", got)
+		t.Fatalf("limit %d did not climb with the cache skip disabled", got)
 	}
 }
 
@@ -350,7 +390,54 @@ func TestIsCacheHitIsAllocationFree(t *testing.T) {
 	h := http.Header{}
 	h.Set("X-Cache", "HIT")
 
-	if n := testing.AllocsPerRun(100, func() { IsCacheHit(h) }); n != 0 {
+	if n := testing.AllocsPerRun(100, func() { IsCacheHitHeader(h) }); n != 0 {
 		t.Fatalf("IsCacheHit allocates %.2f times per call, want 0", n)
+	}
+}
+
+// A client that disconnects makes the handler return early. Recording that
+// duration would read as a fast, healthy service and raise the limit.
+func TestCanceledRequestIsNotObserved(t *testing.T) {
+	lim := newFastLimiter(t) // InitialLimit 100, MaxLimit 200
+	h := Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(time.Millisecond)
+	}), lim)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	req := httptest.NewRequest(http.MethodGet, "/x", nil).WithContext(ctx)
+
+	for i := 0; i < 20; i++ {
+		h.ServeHTTP(&nopWriter{}, req)
+	}
+	time.Sleep(60 * time.Millisecond) // a few ticks
+
+	if got := lim.Limit(); got != 100 {
+		t.Fatalf("limit moved to %d on canceled requests; they must not be observed", got)
+	}
+}
+
+// Same guarantee on the inbound side: even a verdict that asks to observe
+// everything cannot make a canceled request count, because the wrapper drops it
+// first. A truncated measurement is not a fast response.
+func TestCanceledRequestIsNotObservedEvenWithAPermissiveVerdict(t *testing.T) {
+	lim := newFastLimiter(t)
+	v := func(*http.Request, int, http.Header, time.Duration) agilelimiter.Outcome {
+		return agilelimiter.Reached
+	}
+	h := Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(time.Millisecond)
+	}), lim, WithVerdict(v))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	req := httptest.NewRequest(http.MethodGet, "/x", nil).WithContext(ctx)
+	for i := 0; i < 20; i++ {
+		h.ServeHTTP(&nopWriter{}, req)
+	}
+	time.Sleep(60 * time.Millisecond)
+
+	if got := lim.Limit(); got != 100 {
+		t.Fatalf("limit moved to %d on canceled requests; the wrapper must filter them", got)
 	}
 }

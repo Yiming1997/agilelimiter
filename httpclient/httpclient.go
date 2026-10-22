@@ -1,37 +1,38 @@
 // Package httpclient adapts an outbound agilelimiter.Limiter to net/http as a
-// http.RoundTripper, and keeps cache hits out of the control signal.
+// http.RoundTripper, and decides — once, in one function — what each response
+// tells the controller.
 //
-// A cache in front of a downstream splits its traffic into two populations that
-// share one pipe: a hit returns in about a millisecond and consumes none of the
-// origin's capacity, a miss costs whatever the origin costs. Feeding both into
-// one p50 makes the controller track the cache's hit ratio instead of the
-// origin's load. Measured on a 95%-hit workload (compare/cache_test.go): the
-// overall SLO compliance read 98.9% while the requests that actually reached the
-// origin were only 79% within SLO, at p99 369ms. The aggregate metric was green
-// and the origin was saturated.
+// # The problem this package exists to keep out of the core
+//
+// The controller regulates a rate by watching a duration. That only works while
+// the duration measures the thing that is scarce. Plenty of responses do not:
+//
+//	cache hit           ~1ms, no origin capacity used
+//	redirect / 304      cheap, the expensive hop is elsewhere
+//	202 Accepted        the work has not happened yet
+//	fast 5xx / 4xx      answered without doing the work
+//	circuit fallback    never reached the downstream at all
+//
+// Fed unfiltered into one p50, these make a saturated dependency look fast. The
+// library cannot fix that from the inside: only the caller knows what a response
+// means. So this package asks once, with one hook, and otherwise stays out of
+// the way.
 //
 //	client := &http.Client{
-//		Transport: httpclient.Wrap(http.DefaultTransport, lim),
+//		Transport: httpclient.Wrap(http.DefaultTransport, lim,
+//			httpclient.WithVerdict(myVerdict)),
 //	}
 //
-// A hit is detected from the response (see IsCacheHit) and is not observed, so
-// what the controller regulates stays the traffic that costs capacity.
-//
-// Two limits of this design, stated plainly:
-//
-//   - A hit still takes a slot, because the caller cannot know a request will
-//     hit before sending it. Filtering therefore only stops hits from inflating
-//     the health signal; it does not give hits a higher ceiling. To do that, send
-//     hits through a second limiter at the call site, where a local cache already
-//     tells you the answer for free.
-//   - A cache that goes cold is a step change, and an adaptive limiter is a lagging
-//     controller: it will overshoot while it discovers the new capacity. The
-//     defenses against that are outside this package — coalesce misses
-//     (single-flight so one fill serves many), size MaxRate for a cold origin,
-//     and keep a small cache-bypassing probe on the controller's signal.
+// A Verdict — returning agilelimiter.Reached, Unreachable or Aborted — is the
+// whole policy surface. DefaultVerdict is the behaviour you get without one: it
+// is deliberately small and readable, and meant to be copied and edited rather
+// than configured through options.
 package httpclient
 
 import (
+	"context"
+	"errors"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -40,66 +41,58 @@ import (
 	"agilelimiter"
 )
 
+// Verdict decides what one call tells the controller. It is the only policy hook
+// this package has, and it is called once per call, on the caller's goroutine, so
+// it must not block or allocate.
+//
+//	resp and err are exactly what the wrapped RoundTripper returned and may be
+//	nil in the usual ways; d is the wall time spent inside it.
+//
+// The three answers are the three things the controller can be told:
+//
+//	Reached      record d as one observation (the default for an answered call)
+//	Unreachable  treat it as an outage: back off toward MinRate
+//	Aborted      record nothing: this call says nothing about capacity
+//
+// What separates them is not "success or failure" but "did this call use the
+// resource we are protecting". A timeout is a genuine signal and is Reached; a
+// connection that never opened, a cache hit or an async accept is not.
+type Verdict func(resp *http.Response, err error, d time.Duration) agilelimiter.Outcome
+
 // Option customizes the wrapper.
 type Option func(*config)
 
 type config struct {
-	isHit     func(*http.Response) bool
-	badStatus map[int]bool // nil means defaultBadStatus
+	verdict Verdict
 }
 
-// WithCacheHit replaces the cache-hit predicate. Pass a function returning false
-// to observe every response, including hits.
-func WithCacheHit(fn func(*http.Response) bool) Option {
-	return func(c *config) { c.isHit = fn }
-}
-
-// WithErrorStatus overrides which HTTP statuses mean "the downstream refused to
-// serve this". The default is httpserver's 429 plus every 5xx.
-//
-// Such a response is not an error at the transport level — err is nil — but it
-// must never be observed as a healthy fast round trip, which is what happens by
-// default: a service that sheds with an immediate 503 answers in about a
-// millisecond, the controller reads that as "the downstream is fast", and it
-// raises the rate into the thing that just refused it. Those statuses are
-// reported as an outage instead, so the rate backs off toward MinRate.
-//
-// Pass an empty list to disable the behaviour and observe every response.
-func WithErrorStatus(codes ...int) Option {
-	return func(c *config) {
-		c.badStatus = make(map[int]bool, len(codes))
-		for _, s := range codes {
-			c.badStatus[s] = true
-		}
-	}
-}
-
-// defaultBadStatus is a 429 or any 5xx.
-func defaultBadStatus(code int) bool {
-	return code == http.StatusTooManyRequests || (code >= 500 && code <= 599)
+// WithVerdict replaces the verdict. Pass nil to restore DefaultVerdict.
+func WithVerdict(v Verdict) Option {
+	return func(c *config) { c.verdict = v }
 }
 
 // Wrap returns a RoundTripper that takes a slot from lim before each request,
-// measures the round trip, and reports the outcome. Errors go through
-// lim's Config.Classify, so "never reached the downstream" is handled there; a
-// response recognised as a cache hit is not observed at all.
+// measures the round trip, and applies the verdict to the result.
 //
-// A nil rt means http.DefaultTransport.
+// A nil rt means http.DefaultTransport. A nil verdict means DefaultVerdict.
 func Wrap(rt http.RoundTripper, lim *agilelimiter.Limiter, opts ...Option) http.RoundTripper {
-	cfg := config{isHit: IsCacheHit}
+	var cfg config
 	for _, o := range opts {
 		o(&cfg)
 	}
 	if rt == nil {
 		rt = http.DefaultTransport
 	}
-	return &transport{rt: rt, lim: lim, cfg: cfg}
+	if cfg.verdict == nil {
+		cfg.verdict = DefaultVerdict
+	}
+	return &transport{rt: rt, lim: lim, verdict: cfg.verdict}
 }
 
 type transport struct {
-	rt  http.RoundTripper
-	lim *agilelimiter.Limiter
-	cfg config
+	rt      http.RoundTripper
+	lim     *agilelimiter.Limiter
+	verdict Verdict
 }
 
 func (t *transport) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -108,42 +101,94 @@ func (t *transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	resp, err := t.rt.RoundTrip(req)
 	d := time.Since(start)
 
-	if err != nil {
-		// Config.Classify decides what a failure means: a timeout is a real round
-		// trip and is observed, a refused connection becomes a synthetic
-		// congested sample, a caller-side abort is ignored.
-		t.lim.ObserveOutcome(d, err)
+	// A canceled round trip is a truncated measurement, not a fast response: the
+	// call stopped because the caller gave up, not because the downstream was
+	// quick. That is a fact about the measurement rather than a policy choice, so
+	// it is enforced here — replacing the verdict cannot reintroduce the bug.
+	if errors.Is(err, context.Canceled) {
 		return resp, err
 	}
-	if t.isBadStatus(resp.StatusCode) {
-		// The downstream answered, but with "I could not serve this". That is not
-		// an error at the transport level, so it would otherwise be recorded as a
-		// fast healthy round trip — the same trap as a refused connection.
-		//
-		// The attempt's own duration is deliberately discarded: a 503 that took
-		// two seconds and a 503 that took two milliseconds both mean "send less",
-		// and the backoff is capped at one step per tick either way.
+
+	switch t.verdict(resp, err, d) {
+	case agilelimiter.Unreachable:
 		t.lim.Unavailable()
-		return resp, nil
+	case agilelimiter.Aborted:
+		// Nothing: this call is not evidence about capacity.
+	default:
+		t.lim.Observe(d)
 	}
-	if t.cfg.isHit != nil && t.cfg.isHit(resp) {
-		// Served from a cache: no origin capacity was used, so this says nothing
-		// about whether the origin can take more.
-		return resp, nil
-	}
-	t.lim.ObserveOutcome(d, nil)
-	return resp, nil
+	return resp, err
 }
 
-func (t *transport) isBadStatus(code int) bool {
-	if t.cfg.badStatus != nil {
-		return t.cfg.badStatus[code]
+// DefaultVerdict is what Wrap does when no verdict is supplied. It is small on
+// purpose: copy it and edit it rather than looking for an option that tweaks one
+// branch.
+//
+//	429, any 5xx              Unreachable  "do not send more"
+//	dial error (*net.OpError) Unreachable  refused / DNS / no route: nothing was
+//	                                       sent, so the microsecond round trip is
+//	                                       not a fast response
+//	cache hit (Age, X-Cache)  Aborted      no origin capacity was used
+//	anything else             Reached
+//
+// The canceled case is handled by Wrap before the verdict runs, so a replacement
+// verdict cannot lose it; it appears here only so that calling DefaultVerdict
+// directly behaves the same way.
+//
+// Two things it deliberately does not do, because they need knowledge this
+// function does not have:
+//
+//   - An error your own library invents — an open circuit breaker, a rejected
+//     payload — is not a *net.OpError, so it is observed. Add a case if those
+//     return fast:
+//
+//     case errors.Is(err, ErrBreakerOpen):
+//     return agilelimiter.Unreachable
+//
+//   - A 202, or a response served from a local fallback, is cheap and looks
+//     healthy. Add a case if your API uses them:
+//
+//     case resp.StatusCode == http.StatusAccepted:
+//     return agilelimiter.Aborted
+func DefaultVerdict(resp *http.Response, err error, d time.Duration) agilelimiter.Outcome {
+	switch {
+	case err != nil && errors.Is(err, context.Canceled):
+		return agilelimiter.Aborted
+	case err != nil && isDialError(err):
+		// The failure happened while opening the connection: nothing was sent, so
+		// the microsecond round trip says nothing about capacity. This is a phase
+		// check, not an error taxonomy — it covers refused, DNS failure, no route
+		// and connect timeouts without naming any of them.
+		return agilelimiter.Unreachable
+	case err != nil:
+		return agilelimiter.Reached
+	case resp == nil:
+		return agilelimiter.Aborted
+	case defaultUnavailableStatus(resp.StatusCode):
+		return agilelimiter.Unreachable
+	case IsCacheHit(resp):
+		return agilelimiter.Aborted
+	default:
+		return agilelimiter.Reached
 	}
-	return defaultBadStatus(code)
 }
 
-// IsCacheHit reports whether resp was served from a cache rather than computed
-// by the origin. It is the default predicate for Wrap.
+// isDialError reports whether err came from establishing the connection.
+func isDialError(err error) bool {
+	var opErr *net.OpError
+	return errors.As(err, &opErr) && opErr.Op == "dial"
+}
+
+// defaultUnavailableStatus is "do not send more". A client cannot tell an
+// upstream bug from upstream overload, so every 5xx counts: sending less is cheap
+// for us and kind to a dependency that is already failing. (The server-side
+// package draws the line differently, because there the status is your own.)
+func defaultUnavailableStatus(code int) bool {
+	return code == http.StatusTooManyRequests || (code >= 500 && code <= 599)
+}
+
+// IsCacheHit reports whether resp was served from a cache rather than computed by
+// the origin. DefaultVerdict uses it; a custom verdict can too.
 //
 // Two standard signals are enough in practice:
 //
@@ -152,30 +197,37 @@ func (t *transport) isBadStatus(code int) bool {
 //   - a cache-status header saying HIT: X-Cache (Varnish, Fastly, CloudFront),
 //     CF-Cache-Status (Cloudflare), X-Proxy-Cache, X-Cache-Status.
 //
-// A nil response is not a hit. Unknown headers are not a hit: it is better to
-// observe a hit by mistake (the sample dilutes p50, which a higher quantile can
-// still rescue) than to drop a real miss (the only evidence of congestion is
-// gone). When in doubt, this function answers "not a hit".
+// A nil response is not a hit, and neither is an unknown header: observing a hit
+// by mistake only dilutes p50, while dropping a real miss removes the only
+// evidence of congestion.
 func IsCacheHit(resp *http.Response) bool {
 	if resp == nil {
 		return false
 	}
-	if age := strings.TrimSpace(resp.Header.Get("Age")); age != "" {
-		if n, err := strconv.Atoi(age); err == nil && n > 0 {
-			return true
-		}
-	}
-	for _, name := range cacheHeaderNames {
-		if containsHit(resp.Header.Get(name)) {
-			return true
-		}
-	}
-	return false
+	return IsCacheHitHeader(resp.Header)
 }
 
 // cacheHeaderNames is package-level so a range over it does not allocate on the
 // hot path (once per response).
 var cacheHeaderNames = [...]string{"X-Cache", "X-Proxy-Cache", "X-Cache-Status", "CF-Cache-Status"}
+
+// IsCacheHitHeader is IsCacheHit for a bare header set.
+func IsCacheHitHeader(h http.Header) bool {
+	if h == nil {
+		return false
+	}
+	if age := strings.TrimSpace(h.Get("Age")); age != "" {
+		if n, err := strconv.Atoi(age); err == nil && n > 0 {
+			return true
+		}
+	}
+	for _, name := range cacheHeaderNames {
+		if containsHit(h.Get(name)) {
+			return true
+		}
+	}
+	return false
+}
 
 // containsHit is a case-insensitive strings.Contains that does not allocate the
 // way strings.ToLower would.

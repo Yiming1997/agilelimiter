@@ -1,8 +1,10 @@
 package httpclient
 
 import (
+	"context"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -143,12 +145,16 @@ func TestCacheMissIsObserved(t *testing.T) {
 	}
 }
 
-func TestWithCacheHitOverridesPredicate(t *testing.T) {
+// One function is the whole policy surface: a verdict that observes everything
+// overrides the default's cache-hit skip.
+func TestVerdictOverrideObservesEverything(t *testing.T) {
 	lim := newLimiter(t, agilelimiter.Config{MinRate: 10, MaxRate: 1000, InitialRate: 1000})
 	rt := Wrap(&countingTransport{
-		headers: http.Header{"Age": {"120"}}, // IsCacheHit would skip this
+		headers: http.Header{"Age": {"120"}}, // DefaultVerdict would skip this
 		delay:   2 * time.Millisecond,
-	}, lim, WithCacheHit(func(*http.Response) bool { return false }))
+	}, lim, WithVerdict(func(*http.Response, error, time.Duration) agilelimiter.Outcome {
+		return agilelimiter.Reached
+	}))
 
 	for i := 0; i < 5; i++ {
 		resp, err := rt.RoundTrip(httptest.NewRequest(http.MethodGet, "http://example.com/", nil))
@@ -158,29 +164,34 @@ func TestWithCacheHitOverridesPredicate(t *testing.T) {
 		resp.Body.Close()
 	}
 	if !waitForBaseline(lim, time.Second) {
-		t.Fatal("WithCacheHit(false) should make every response observable")
+		t.Fatal("a verdict returning Reached must make every response observable")
 	}
 }
 
 var errUnreachable = errors.New("connection refused")
 
-func TestTransportErrorGoesThroughClassify(t *testing.T) {
+// The verdict sees exactly what the transport returned, which is what makes
+// "this never reached the downstream" expressible at all.
+func TestVerdictSeesTheTransportError(t *testing.T) {
 	var seen error
 	lim := newLimiter(t, agilelimiter.Config{
 		MinRate: 10, MaxRate: 1000, InitialRate: 100,
 		SLOTarget: 200 * time.Millisecond,
-		Classify: func(err error) agilelimiter.Outcome {
-			seen = err
-			return agilelimiter.Unreachable
-		},
 	})
-	rt := Wrap(failingTransport{}, lim)
+	rt := Wrap(failingTransport{}, lim, WithVerdict(
+		func(_ *http.Response, err error, _ time.Duration) agilelimiter.Outcome {
+			seen = err
+			if errors.Is(err, errUnreachable) {
+				return agilelimiter.Unreachable
+			}
+			return agilelimiter.Reached
+		}))
 
 	if _, err := rt.RoundTrip(httptest.NewRequest(http.MethodGet, "http://example.com/", nil)); err == nil {
 		t.Fatal("expected the transport error to be returned")
 	}
 	if !errors.Is(seen, errUnreachable) {
-		t.Fatalf("Config.Classify saw %v, want %v", seen, errUnreachable)
+		t.Fatalf("the verdict saw %v, want %v", seen, errUnreachable)
 	}
 }
 
@@ -220,24 +231,25 @@ func driveFor(t *testing.T, rt http.RoundTripper, d time.Duration) {
 	}
 }
 
-// A 429 or a 5xx is not a Go error, so without explicit handling it looks like a
-// fast, healthy round trip and the controller accelerates into the service that
-// just refused it. A 404 is a real round trip and must not be treated that way.
+// A 429 or a 5xx is not a Go error, so without the verdict it looks like a fast,
+// healthy round trip and the controller accelerates into the service that just
+// refused it. A 404 is a real round trip and must not be treated that way.
 func TestStatusClassification(t *testing.T) {
 	cases := []struct {
 		name    string
 		status  int
-		opts    []Option
+		verdict Verdict
 		backoff bool
 	}{
 		{"503 backs off", http.StatusServiceUnavailable, nil, true},
 		{"500 backs off", http.StatusInternalServerError, nil, true},
 		{"429 backs off", http.StatusTooManyRequests, nil, true},
 		{"404 is a healthy round trip", http.StatusNotFound, nil, false},
-		{"WithErrorStatus() disables it", http.StatusServiceUnavailable,
-			[]Option{WithErrorStatus()}, false},
-		{"WithErrorStatus(503) stops 500 backing off", http.StatusInternalServerError,
-			[]Option{WithErrorStatus(http.StatusServiceUnavailable)}, false},
+		{"a custom verdict narrows it to 503", http.StatusInternalServerError, statusBackoff(503), false},
+		{"a custom verdict turns it off", http.StatusServiceUnavailable,
+			func(*http.Response, error, time.Duration) agilelimiter.Outcome {
+				return agilelimiter.Reached
+			}, false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -246,7 +258,11 @@ func TestStatusClassification(t *testing.T) {
 				SLOTarget: time.Second,
 				Tick:      10 * time.Millisecond,
 			})
-			rt := Wrap(statusTransport{status: c.status, delay: time.Millisecond}, lim, c.opts...)
+			var opts []Option
+			if c.verdict != nil {
+				opts = append(opts, WithVerdict(c.verdict))
+			}
+			rt := Wrap(statusTransport{status: c.status, delay: time.Millisecond}, lim, opts...)
 			driveFor(t, rt, 300*time.Millisecond)
 
 			got := lim.Rate()
@@ -260,13 +276,100 @@ func TestStatusClassification(t *testing.T) {
 	}
 }
 
-// IsCacheHit runs once per response, so it must not allocate. The first version
-// used strings.ToLower plus a per-call slice literal and cost 16B every time.
+// statusBackoff is an example of a small custom policy: back off on exactly these
+// statuses, hand everything else to the default.
+func statusBackoff(codes ...int) Verdict {
+	return func(resp *http.Response, err error, d time.Duration) agilelimiter.Outcome {
+		if err != nil {
+			return DefaultVerdict(resp, err, d)
+		}
+		for _, c := range codes {
+			if resp != nil && resp.StatusCode == c {
+				return agilelimiter.Unreachable
+			}
+		}
+		return agilelimiter.Reached
+	}
+}
+
+// The default is a pure function, so its rules are testable directly instead of
+// only through a running limiter.
+func TestDefaultVerdictRules(t *testing.T) {
+	cases := []struct {
+		name string
+		resp *http.Response
+		err  error
+		want agilelimiter.Outcome
+	}{
+		{"200 observed", &http.Response{StatusCode: 200, Header: http.Header{}}, nil, agilelimiter.Reached},
+		{"404 observed", &http.Response{StatusCode: 404, Header: http.Header{}}, nil, agilelimiter.Reached},
+		{"429 backs off", &http.Response{StatusCode: 429, Header: http.Header{}}, nil, agilelimiter.Unreachable},
+		{"503 backs off", &http.Response{StatusCode: 503, Header: http.Header{}}, nil, agilelimiter.Unreachable},
+		{"500 backs off", &http.Response{StatusCode: 500, Header: http.Header{}}, nil, agilelimiter.Unreachable},
+		{"cache hit skipped", &http.Response{StatusCode: 200, Header: http.Header{"X-Cache": {"HIT"}}}, nil, agilelimiter.Aborted},
+		{"canceled skipped", nil, context.Canceled, agilelimiter.Aborted},
+		{"timeout observed", nil, context.DeadlineExceeded, agilelimiter.Reached},
+		{"nil response skipped", nil, nil, agilelimiter.Aborted},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := DefaultVerdict(c.resp, c.err, 10*time.Millisecond); got != c.want {
+				t.Fatalf("DefaultVerdict = %v, want %v", got, c.want)
+			}
+		})
+	}
+}
+
+// IsCacheHit runs once per response, so it must not allocate.
 func TestIsCacheHitIsAllocationFree(t *testing.T) {
 	h := http.Header{}
 	h.Set("X-Cache", "HIT")
 	resp := &http.Response{Header: h}
 	if n := testing.AllocsPerRun(100, func() { IsCacheHit(resp) }); n != 0 {
 		t.Fatalf("IsCacheHit allocates %.2f times per call, want 0", n)
+	}
+}
+
+// Replacing the verdict must not be able to reintroduce "a canceled call reads as
+// a fast healthy response": the wrapper filters that before the verdict runs,
+// because it is a broken measurement rather than a policy choice.
+func TestCanceledIsNotObservedEvenWithAPermissiveVerdict(t *testing.T) {
+	lim := newLimiter(t, agilelimiter.Config{MinRate: 10, MaxRate: 1000, InitialRate: 1000})
+	rt := Wrap(canceledTransport{}, lim, WithVerdict(
+		func(*http.Response, error, time.Duration) agilelimiter.Outcome {
+			return agilelimiter.Reached // asks to observe everything
+		}))
+
+	for i := 0; i < 5; i++ {
+		if _, err := rt.RoundTrip(httptest.NewRequest(http.MethodGet, "http://example.com/", nil)); !errors.Is(err, context.Canceled) {
+			t.Fatalf("error = %v, want context.Canceled", err)
+		}
+	}
+	if waitForBaseline(lim, 300*time.Millisecond) {
+		t.Fatalf("a canceled call reached the controller (baseline %v); the wrapper must filter it", lim.Stats().Baseline)
+	}
+}
+
+type canceledTransport struct{}
+
+func (canceledTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	return nil, context.Canceled
+}
+
+// A failure while opening the connection says nothing about capacity: nothing was
+// sent, and it returns in microseconds. This is a phase check on the error, not a
+// taxonomy, so refused / DNS / no route / connect timeout all land here.
+func TestDefaultVerdictClassifiesDialErrors(t *testing.T) {
+	dial := &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connection refused")}
+	read := &net.OpError{Op: "read", Net: "tcp", Err: errors.New("connection reset")}
+
+	if got := DefaultVerdict(nil, dial, time.Microsecond); got != agilelimiter.Unreachable {
+		t.Fatalf("dial error = %v, want Unreachable", got)
+	}
+	if got := DefaultVerdict(nil, read, 5*time.Second); got != agilelimiter.Reached {
+		t.Fatalf("read error = %v, want Reached: the call reached the downstream", got)
+	}
+	if got := DefaultVerdict(nil, errUnreachable, time.Microsecond); got != agilelimiter.Reached {
+		t.Fatalf("plain error = %v, want Reached: only a *net.OpError proves the dial phase", got)
 	}
 }

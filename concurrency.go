@@ -174,7 +174,7 @@ func (l *ConcurrencyLimiter) Do(fn func() error) error {
 // observeOutcome tells the controller what a request's result says about the
 // service. See Limiter.observeOutcome and Outcome.
 func (l *ConcurrencyLimiter) observeOutcome(d time.Duration, err error) {
-	out := Reached
+	out := defaultOutcome(err) // context.Canceled -> Aborted, see defaultOutcome
 	if err != nil && l.cfg.Classify != nil {
 		out = l.cfg.Classify(err)
 	}

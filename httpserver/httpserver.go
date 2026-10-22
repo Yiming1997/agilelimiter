@@ -1,22 +1,35 @@
 // Package httpserver adapts an inbound agilelimiter.ConcurrencyLimiter to
-// net/http: it sheds load with 429 when the service is saturated, and feeds
-// every admitted request's handling time back to the controller.
+// net/http: it sheds load with 429 when the service is saturated, and feeds each
+// admitted request's handling time back to the controller.
 //
-// Apply it once, around the whole protected subtree. Every route beneath shares
-// the same concurrency budget, because they compete for the same process
-// resources — do not build a limiter per endpoint.
+// # One hook, no built-in opinion about what a response means
 //
-//	lim := agilelimiter.NewConcurrency(agilelimiter.ConcurrencyConfig{
-//		MaxLimit:     200,
-//		InitialLimit: 20,
-//		SLOTarget:    300 * time.Millisecond,
-//	})
-//	lim.Start()
-//	defer lim.Stop()
+// A handler that fails instantly reports a ~0 handling time, and so does one
+// served from memory, one rejected by an auth check, and a CORS preflight. Fed
+// unfiltered into one p50 they make a struggling service look fast. Only the
+// caller knows what a response means, so this package asks once:
 //
-//	mux := http.NewServeMux()
-//	mux.HandleFunc("/api/things", getThings)
-//	http.ListenAndServe(":8080", httpserver.Wrap(mux, lim))
+//	lim := agilelimiter.NewConcurrency(agilelimiter.ConcurrencyConfig{...})
+//	srv := httpserver.Wrap(mux, lim,
+//		httpserver.WithVerdict(myVerdict))
+//
+//	func myVerdict(r *http.Request, status int, h http.Header, d time.Duration) agilelimiter.Outcome {
+//		switch {
+//		case r.Context().Err() != nil:
+//			return agilelimiter.Aborted
+//		case strings.HasPrefix(r.URL.Path, "/health"), r.URL.Path == "/metrics":
+//			return agilelimiter.Aborted
+//		case status == http.StatusTooManyRequests, status >= 500:
+//			return agilelimiter.Unreachable
+//		case httpserver.IsCacheHitHeader(h):
+//			return agilelimiter.Aborted
+//		default:
+//			return agilelimiter.Reached
+//		}
+//	}
+//
+// DefaultVerdict is the behaviour you get without one: small, readable, and meant
+// to be copied and edited rather than configured through options.
 package httpserver
 
 import (
@@ -32,6 +45,20 @@ import (
 	"agilelimiter"
 )
 
+// Verdict decides what one admitted request tells the controller. It is the only
+// policy hook this middleware has, and it is called once per request, after the
+// handler ran, so it must not block or allocate.
+//
+//	status is what the handler wrote (200 if it never called WriteHeader) and h
+//	are the response headers it set; d is the handler's own duration.
+//
+// The three answers are the three things the controller can be told:
+//
+//	Reached      record d as one observation (the default for real work)
+//	Unreachable  treat it as an outage: back off toward MinLimit
+//	Aborted      record nothing: this request says nothing about capacity
+type Verdict func(r *http.Request, status int, h http.Header, d time.Duration) agilelimiter.Outcome
+
 // Option customizes a Wrap middleware. The zero set is a plain-text 429 with no
 // Retry-After header.
 type Option func(*config)
@@ -39,8 +66,7 @@ type Option func(*config)
 type config struct {
 	retryAfter time.Duration
 	reject     http.HandlerFunc
-	isHit      func(http.Header) bool
-	badStatus  map[int]bool // nil means defaultUnavailableStatus
+	verdict    Verdict
 }
 
 // WithRetryAfter sets the Retry-After header (whole seconds, rounded up) on a
@@ -56,36 +82,45 @@ func WithReject(h http.HandlerFunc) Option {
 	return func(c *config) { c.reject = h }
 }
 
-// WithCacheHit replaces the predicate that decides a response was served without
-// touching the expensive path. It receives the response headers after the
-// handler ran. The default is IsCacheHit.
-//
-// A hit is not observed, because a request answered from a cache says nothing
-// about how much of the service's real capacity is left — the same reason
-// httpclient skips hits on the outbound side.
-func WithCacheHit(fn func(http.Header) bool) Option {
-	return func(c *config) { c.isHit = fn }
+// WithVerdict replaces the verdict. Pass nil to restore DefaultVerdict.
+func WithVerdict(v Verdict) Option {
+	return func(c *config) { c.verdict = v }
 }
 
-// WithErrorStatus replaces the set of response statuses that mean "this request
-// could not be served right now" rather than "your code has a bug". Those are
-// reported to the controller as an outage, so the limit backs off instead of
-// climbing on a stream of instant failures. Pass an empty list to disable it.
+// DefaultVerdict is what Wrap does when no verdict is supplied. Copy it and edit
+// it rather than looking for an option that tweaks one branch.
 //
-// The default is 429, 502, 503 and 504. A plain 500 is deliberately excluded: it
-// usually means a bug, and backing off does not fix a bug — it only turns a
-// failing endpoint into a smaller failing endpoint. Raise it to a whole 5xx range
-// if your service uses 500 for overload.
-func WithErrorStatus(codes ...int) Option {
-	return func(c *config) {
-		c.badStatus = make(map[int]bool, len(codes))
-		for _, s := range codes {
-			c.badStatus[s] = true
-		}
+//	request context canceled   Aborted      the client went away; the handler
+//	                                        returned early because nobody is
+//	                                        listening, not because it was fast
+//	429, 502, 503, 504         Unreachable  "cannot serve right now"
+//	cache hit (Age, X-Cache)   Aborted      no expensive path was touched
+//	anything else              Reached      including 500, which is usually a
+//	                                        bug: backing off would turn a failing
+//	                                        endpoint into a smaller one
+//
+// Two things it deliberately does not do, because they need knowledge this
+// function does not have:
+//
+//   - Health checks, metrics scrapes and CORS preflights are cheap and, on a
+//     low-traffic service, a large share of the samples. Exclude them by path.
+//   - A long-lived stream (SSE, websocket upgrade, long poll) drags the median
+//     up for every other request sharing the limiter. Give it its own budget.
+func DefaultVerdict(r *http.Request, status int, h http.Header, d time.Duration) agilelimiter.Outcome {
+	switch {
+	case r != nil && r.Context().Err() != nil:
+		return agilelimiter.Aborted
+	case defaultUnavailableStatus(status):
+		return agilelimiter.Unreachable
+	case IsCacheHitHeader(h):
+		return agilelimiter.Aborted
+	default:
+		return agilelimiter.Reached
 	}
 }
 
-// defaultUnavailableStatus is the statuses that mean "cannot serve right now".
+// defaultUnavailableStatus is the statuses that mean "cannot serve right now"
+// rather than "your code has a bug".
 func defaultUnavailableStatus(code int) bool {
 	switch code {
 	case http.StatusTooManyRequests, // 429
@@ -97,70 +132,22 @@ func defaultUnavailableStatus(code int) bool {
 	return false
 }
 
-// Wrap returns an http.Handler that admits each request through lim. An admitted
-// request runs next and its handling time is observed. A request that cannot get
-// a slot is shed immediately (default 429) rather than queued — shedding, not
-// queueing, is what keeps the limiter from amplifying an overload.
+// cacheHeaderNames is package-level so a range over it does not allocate on the
+// hot path (once per request).
+var cacheHeaderNames = [...]string{"X-Cache", "X-Proxy-Cache", "X-Cache-Status", "CF-Cache-Status"}
+
+// IsCacheHitHeader reports whether the response was served from a cache rather
+// than computed on the expensive path. DefaultVerdict uses it; a custom verdict
+// can too.
 //
-// The measured time is next's own duration: admission never blocks, so there is
-// no queue wait to contaminate the signal, and rejected requests are never
-// observed. The slot is released even if next panics.
-//
-// The response is inspected before it is observed. A status in the unavailable
-// set (429/502/503/504 by default) becomes an outage sample, so a handler that
-// fails instantly cannot pass for a fast healthy service and raise the limit; a
-// response recognised as a cache hit is not observed at all. Both are
-// configurable, and both only look at what the handler already wrote.
-func Wrap(next http.Handler, lim *agilelimiter.ConcurrencyLimiter, opts ...Option) http.Handler {
-	cfg := config{isHit: IsCacheHit}
-	for _, o := range opts {
-		o(&cfg)
-	}
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !lim.TryTake() {
-			reject(w, r, cfg)
-			return
-		}
-		defer lim.Release() // released even if next panics
-
-		start := time.Now()
-		sw := &statusWriter{ResponseWriter: w}
-		next.ServeHTTP(sw, r)
-		d := time.Since(start)
-
-		if cfg.isBadStatus(sw.status()) {
-			// The request was admitted but the service could not serve it. Its
-			// duration is discarded on purpose: a 503 that took 5ms and one that
-			// took 5s both mean "stop admitting", and the backoff is one step per
-			// tick either way.
-			lim.Unavailable()
-			return
-		}
-		if cfg.isHit != nil && cfg.isHit(w.Header()) {
-			return // cheap path: says nothing about remaining capacity
-		}
-		lim.Observe(d)
-	})
-}
-
-func (c *config) isBadStatus(code int) bool {
-	if c.badStatus != nil {
-		return c.badStatus[code]
-	}
-	return defaultUnavailableStatus(code)
-}
-
-// IsCacheHit reports whether the response was served from a cache rather than
-// computed on the expensive path. It is the default predicate for Wrap.
-//
-// It reads the standard signals: an Age header greater than zero (RFC 7234), or
-// a HIT in X-Cache / X-Proxy-Cache / X-Cache-Status / CF-Cache-Status. Your
-// handler has to set one of them — for a hit served out of process, by your own
-// cache, that is a single line before writing the body.
+// It reads the standard signals: an Age header greater than zero (RFC 7234), or a
+// HIT in X-Cache / X-Proxy-Cache / X-Cache-Status / CF-Cache-Status. Your handler
+// has to set one — for a hit served by your own cache that is a single line
+// before writing the body.
 //
 // Unknown headers answer "not a hit": observing a hit by mistake only dilutes
 // p50, while dropping a real request removes the only evidence of congestion.
-func IsCacheHit(h http.Header) bool {
+func IsCacheHitHeader(h http.Header) bool {
 	if h == nil {
 		return false
 	}
@@ -177,10 +164,6 @@ func IsCacheHit(h http.Header) bool {
 	return false
 }
 
-// cacheHeaderNames is package-level so a range over it does not allocate on the
-// hot path (once per response).
-var cacheHeaderNames = [...]string{"X-Cache", "X-Proxy-Cache", "X-Cache-Status", "CF-Cache-Status"}
-
 // containsHit is a case-insensitive strings.Contains that does not allocate the
 // way strings.ToLower would.
 func containsHit(s string) bool {
@@ -191,6 +174,55 @@ func containsHit(s string) bool {
 		}
 	}
 	return false
+}
+
+// Wrap returns an http.Handler that admits each request through lim. An admitted
+// request runs next and its handling time is reported to the controller through
+// the verdict. A request that cannot get a slot is shed immediately (default 429)
+// rather than queued — shedding, not queueing, is what keeps the limiter from
+// amplifying an overload.
+//
+// The measured time is next's own duration: admission never blocks, so there is
+// no queue wait to contaminate the signal, and rejected requests are never
+// measured. The slot is released even if next panics.
+func Wrap(next http.Handler, lim *agilelimiter.ConcurrencyLimiter, opts ...Option) http.Handler {
+	var cfg config
+	for _, o := range opts {
+		o(&cfg)
+	}
+	verdict := cfg.verdict
+	if verdict == nil {
+		verdict = DefaultVerdict
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !lim.TryTake() {
+			reject(w, r, cfg)
+			return
+		}
+		defer lim.Release() // released even if next panics
+
+		start := time.Now()
+		sw := &statusWriter{ResponseWriter: w}
+		next.ServeHTTP(sw, r)
+		d := time.Since(start)
+
+		// A canceled request is a truncated measurement: the handler returned
+		// because nobody is listening, not because it was fast. That is a fact
+		// about the measurement rather than a policy choice, so it is enforced
+		// here — replacing the verdict cannot reintroduce the bug.
+		if r.Context().Err() != nil {
+			return
+		}
+
+		switch verdict(r, sw.status(), w.Header(), d) {
+		case agilelimiter.Unreachable:
+			lim.Unavailable()
+		case agilelimiter.Aborted:
+			// Nothing: this request is not evidence about capacity.
+		default:
+			lim.Observe(d)
+		}
+	})
 }
 
 // statusWriter records the status the handler wrote without changing anything

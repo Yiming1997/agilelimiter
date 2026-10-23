@@ -335,13 +335,11 @@ measured. `Wrap` releases the slot even if the handler panics, and
 mount it *outside* the wrapper so it stays readable while the service is
 saturated.
 
-#### What the middleware does *not* observe
+#### What the middleware records, and what you tell it
 
 A handler that fails instantly reports a ~0 handling time, which would otherwise
-read as "this service is fast and healthy" and raise the limit. So the response
-is inspected before it is measured:
-
-#### What the middleware records, and what you tell it
+read as "this service is fast and healthy" and raise the limit. So the response is
+inspected before it is measured.
 
 Same one-hook design as the outbound side:
 
@@ -385,6 +383,63 @@ Two cases the default does not handle, because they need knowledge it does not
 have: **health/metrics/preflight** (exclude by path, as above) and **long-lived
 streams** (SSE, websocket, long poll — give them their own budget, or the median
 of every other request pays for them).
+
+## Why the filtering works this way
+
+Everything above is one rule: **a duration is evidence only while it measures the
+resource you are protecting.** A cache hit, an instant 503, a `/healthz` probe and
+a circuit-breaker fallback all return in about a millisecond, and none of them say
+anything about remaining capacity. Fed into one p50 they make a saturated
+dependency look fast — and the controller's answer to "fast" is to raise the rate.
+
+It cannot be fixed inside the controller: deciding what a response *means* needs
+the response. It cannot be a fixed set of built-in cases either, for two reasons:
+
+- **The list does not converge.** Every year adds a proxy header, an async
+  endpoint, a framework convention. One option per case is a treadmill.
+- **Every built-in case is wrong for somebody.** A 202 is free if your queue is
+  cheap and expensive if enqueueing *is* the bottleneck; a 4xx flood is noise from
+  a client bug and signal from a broken auth service. The library does not know
+  which company it is in.
+
+So it is split into three layers:
+
+| Layer | Who owns it | Can it be overridden? |
+|---|---|---|
+| **Truncated measurement** — the call was canceled, or the client disconnected | the library | **no.** A truncated sample is not a fast response, it is not a measurement at all |
+| **Default policy** — 429/5xx, dial failures, cache hits | `DefaultVerdict`, about six lines | yes — replace it wholesale |
+| **Everything else** — health paths, 202, 4xx floods, your own error types | you, one line each | — |
+
+The middle layer ships as a *function* rather than as options because a function
+is readable, testable as a pure function, and composable: your verdict can call
+`DefaultVerdict` for everything it does not care about.
+
+### What is left to you
+
+| Case | Why the default cannot decide | Answer |
+|---|---|---|
+| `/healthz`, `/metrics`, `/favicon.ico` | depends on your routes; on a quiet service they can be most of the samples | `Aborted` by path |
+| CORS preflight, `HEAD` | depends on your routes | `Aborted` |
+| 202 Accepted / fire-and-forget | depends on whether enqueueing is your bottleneck | `Aborted` or `Reached` |
+| circuit-breaker fallback | your own error, not a `*net.OpError` | `Unreachable` |
+| 4xx flood | your business judgement | `Aborted` |
+| SSE / long poll / websocket | not cheap — it drags the median up for everyone else | its own limiter |
+
+### What no amount of filtering fixes
+
+These are properties of the control law and of the deployment, not of the signal:
+
+- **Capacity that moves faster than the controller.** Ramping is `UpStep` per tick
+  (5% by default), so a swing with a period of a few seconds outruns it.
+- **Cold start and recovery.** Going from `MinLimit` to `MaxLimit` costs
+  `ln(MaxLimit/MinLimit)` ticks of +5%: about 80 s at the default 1 s tick, about
+  20 s at 250 ms. A fixed rate has no ramp — this is the single biggest thing this
+  library gives up, and the reason to warm-start near a plausible value rather
+  than at the floor.
+- **A cache going cold.** That is a step change; the backstop is single-flight and
+  sizing `MaxRate` for a *cold* origin, not a better classifier.
+- **Many instances.** Each process converges on its own; there is no shared view
+  of a shared dependency.
 
 ## Pitfalls (read before tuning)
 

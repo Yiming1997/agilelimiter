@@ -159,6 +159,7 @@ func BenchmarkInboundColdStart(b *testing.B) {
 	}{
 		{"agile-init10", agileColdArm(sc, 10)},
 		{"agile-init100", agileColdArm(sc, 100)},
+		{"agile-default", agileColdArm(sc, 0)}, // no InitialLimit: MaxLimit/8
 		{fmt.Sprintf("uber-fixed-%.0f", ceiling), uberInArm(int(ceiling))},
 	}
 

@@ -39,7 +39,7 @@ downstream RTT ──> histogram (p50/p99) ──> fast/slow EWMA ──> rate f
 lim := agilelimiter.New(agilelimiter.Config{
 	MinRate:     20,         // never go below this many req/s
 	MaxRate:     500,        // hard ceiling you promise the downstream
-	InitialRate: 50,         // cold-start low, let it ramp up
+	InitialRate: 50,         // optional; defaults to MaxRate/8
 	SLOTarget:   200 * time.Millisecond, // optional: p99 tail guard
 })
 lim.Start()
@@ -236,16 +236,26 @@ Each tick:
 2. Update `fast` (short half-life) and `slow` (long half-life) EWMAs of p50.
 3. Compare `fast` against a window around the tolerated latency
    `high = slow * (1 + TargetInflation)`, `low = high * (1 - Deadband)`:
-   - `fast <= low` → healthy, additive-increase probe (`+UpStep`).
+   - `fast <= low` → healthy, probe up: `+UpStep`, or `×SlowStartGain` while the
+     limiter has never seen congestion (cold start — see below).
    - `fast >= high` → congested, proportional decrease `1 - Gain*(excess/high)`,
      capped at `-DownStep`.
    - in between → hold (deadband).
 4. If p99 exceeds `SLOTarget`, force a full `-DownStep`.
 5. Clamp to `[MinRate, MaxRate]` and push to the bucket.
 
-**Asymmetry is intentional**: back off fast, ramp up slowly. It is friendlier to
-the downstream and resists oscillation around the knee. The baseline EWMA itself
-is also asymmetric — it falls quickly and rises slowly (see Pitfalls).
+**Asymmetry is intentional**: back off fast (30%/tick), ramp up slowly (5%/tick).
+It is friendlier to the downstream and resists oscillation around the knee. The
+baseline EWMA itself is also asymmetric — it falls quickly and rises slowly (see
+Pitfalls).
+
+**Cold start is the one exception.** Before the first backoff the controller does
+not know where the knee is, so `+5%/tick` is guessing very slowly: 10→500 costs 80
+ticks. It doubles instead (`SlowStartGain`, default 2.0), which costs 6. The
+asymmetry above is exactly what makes this safe — overshooting costs two ticks to
+correct, undershooting costs eighty. The flag clears on the first backoff (or at
+`MaxRate`) and never re-arms, so recovery from an outage is still an ordinary
+AIMD ramp.
 
 ## Inbound: protecting your own service (concurrency limiting)
 
@@ -270,7 +280,7 @@ different:
 lim := agilelimiter.NewConcurrency(agilelimiter.ConcurrencyConfig{
 	MinLimit:     10,   // never admit fewer than this many concurrent
 	MaxLimit:     500,  // hard ceiling you promise the service
-	InitialLimit: 50,   // cold-start low, let it ramp up
+	InitialLimit: 50,   // optional; defaults to MaxLimit/8
 	SLOTarget:    200 * time.Millisecond, // optional: p99 tail guard
 })
 lim.Start()
@@ -429,13 +439,16 @@ is readable, testable as a pure function, and composable: your verdict can call
 
 These are properties of the control law and of the deployment, not of the signal:
 
-- **Capacity that moves faster than the controller.** Ramping is `UpStep` per tick
-  (5% by default), so a swing with a period of a few seconds outruns it.
-- **Cold start and recovery.** Going from `MinLimit` to `MaxLimit` costs
-  `ln(MaxLimit/MinLimit)` ticks of +5%: about 80 s at the default 1 s tick, about
-  20 s at 250 ms. A fixed rate has no ramp — this is the single biggest thing this
-  library gives up, and the reason to warm-start near a plausible value rather
-  than at the floor.
+- **Capacity that moves faster than the controller.** Steady-state ramping is
+  `UpStep` per tick (5% by default), so a swing with a period of a few seconds
+  outruns it.
+- **Cold start and recovery.** A *fresh* limiter doubles while it has never seen
+  congestion (`SlowStartGain`, default 2.0), so it finds the knee in
+  `log2(MaxRate/InitialRate)` ticks — 6 instead of 80 for 10→500. A limiter that
+  has already backed off ramps at `UpStep`, so **recovery after a deep dip is
+  still slow** (`ln(MaxLimit/MinLimit)` ticks): the flag never re-arms, which is
+  what keeps AIMD's conservatism intact. Persisting the last good limit across
+  restarts is the fix for the remaining case.
 - **A cache going cold.** That is a step change; the backstop is single-flight and
   sizing `MaxRate` for a *cold* origin, not a better classifier.
 - **Many instances.** Each process converges on its own; there is no shared view

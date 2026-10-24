@@ -39,6 +39,13 @@ type controller struct {
 	rate  float64 // current target rate, requests per second
 	ready bool
 
+	// coldStart is true until the controller has evidence of congestion, i.e. it
+	// knows where the knee is. While it is true a healthy tick multiplies the
+	// rate (SlowStartGain) instead of adding UpStep, so an unknown capacity is
+	// found in log2 ticks rather than in ln/ln(1+UpStep) ticks. See the
+	// SlowStartGain field for why the asymmetry justifies this.
+	coldStart bool
+
 	// what the last completed tick saw, for Stats
 	lastP50, lastP99 time.Duration
 	lastSamples      uint64
@@ -54,6 +61,7 @@ func newController(cfg Config, hist *histogram, setRate func(rate int)) *control
 		hist:          hist,
 		setRate:       setRate,
 		rate:          float64(cfg.InitialRate),
+		coldStart:     true,
 		fastAlpha:     ewmaAlpha(cfg.FastHalfLife, cfg.Tick),
 		slowUpAlpha:   ewmaAlpha(cfg.SlowHalfLife, cfg.Tick),
 		slowDownAlpha: ewmaAlpha(cfg.SlowDownHalfLife, cfg.Tick),
@@ -131,10 +139,19 @@ func (c *controller) step() {
 	var factor float64
 	switch {
 	case c.fast <= low:
-		factor = 1 + c.cfg.UpStep // healthy: additive-increase probe
+		// Healthy: probe up. Additively, unless we have never seen congestion —
+		// then we do not know where the knee is and doubling finds it in log2
+		// ticks. Overshooting on the way up is cheap (DownStep is 0.30, so two
+		// ticks bring us back); undershooting is not (UpStep is 0.05).
+		if c.coldStart && c.cfg.SlowStartGain > 1 {
+			factor = c.cfg.SlowStartGain
+		} else {
+			factor = 1 + c.cfg.UpStep
+		}
 	case c.fast >= high:
 		over := (c.fast - high) / high
 		factor = 1 - math.Min(c.cfg.DownStep, c.cfg.Gain*over)
+		c.coldStart = false // we found the knee; ordinary AIMD from here on
 	default:
 		factor = 1 // within the band: hold
 	}
@@ -152,9 +169,13 @@ func (c *controller) step() {
 		if floor := 1 - c.cfg.DownStep; factor > floor {
 			factor = floor
 		}
+		c.coldStart = false // the tail is congestion evidence too
 	}
 
 	c.rate = clampRate(c.rate*factor, c.cfg.MinRate, c.cfg.MaxRate)
+	if c.rate >= float64(c.cfg.MaxRate) {
+		c.coldStart = false // nothing left to discover up there
+	}
 	c.setRate(int(math.Round(c.rate)))
 }
 
@@ -170,12 +191,13 @@ func (c *controller) stats() Stats {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return Stats{
-		Rate:     c.rate,
-		Baseline: time.Duration(c.slow),
-		Fast:     time.Duration(c.fast),
-		Samples:  c.lastSamples,
-		P50:      c.lastP50,
-		P99:      c.lastP99,
+		Rate:      c.rate,
+		Baseline:  time.Duration(c.slow),
+		Fast:      time.Duration(c.fast),
+		Samples:   c.lastSamples,
+		P50:       c.lastP50,
+		P99:       c.lastP99,
+		ColdStart: c.coldStart,
 	}
 }
 

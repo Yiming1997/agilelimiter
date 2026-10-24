@@ -42,14 +42,15 @@ func TestStatsReportsWhatTheLastTickSaw(t *testing.T) {
 // is a per-tick increment, so that silently doubles the gains too.
 func TestStartIsIdempotent(t *testing.T) {
 	l := New(Config{
-		MinRate:      10,
-		MaxRate:      200_000,
-		InitialRate:  100,
-		UpStep:       0.5, // 1.5x per tick makes N loops obvious after a few ticks
-		Tick:         20 * time.Millisecond,
-		FastHalfLife: 10 * time.Millisecond,
-		SlowHalfLife: 10 * time.Millisecond,
-		SLOTarget:    time.Second,
+		MinRate:       10,
+		MaxRate:       200_000,
+		InitialRate:   100,
+		UpStep:        0.5, // 1.5x per tick makes N loops obvious after a few ticks
+		SlowStartGain: 1,   // this test is about loop count, not about cold start
+		Tick:          20 * time.Millisecond,
+		FastHalfLife:  10 * time.Millisecond,
+		SlowHalfLife:  10 * time.Millisecond,
+		SLOTarget:     time.Second,
 	})
 	l.Start()
 	l.Start()
@@ -74,6 +75,7 @@ func TestConcurrencyStartIsIdempotent(t *testing.T) {
 		MaxLimit:         200_000,
 		InitialLimit:     100,
 		UpStep:           0.5,
+		SlowStartGain:    1, // this test is about loop count, not about cold start
 		Tick:             20 * time.Millisecond,
 		FastHalfLife:     10 * time.Millisecond,
 		SlowHalfLife:     10 * time.Millisecond,

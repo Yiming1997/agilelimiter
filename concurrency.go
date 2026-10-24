@@ -51,6 +51,11 @@ type ConcurrencyConfig struct {
 	// UpStep / DownStep cap the fractional change per tick (down faster than up).
 	UpStep   float64
 	DownStep float64
+	// SlowStartGain is the multiplicative increase used while the controller has
+	// never had to back off, i.e. while it does not know where the knee is.
+	// Default 2.0: reaching MaxLimit costs log2 of the ratio in ticks instead of
+	// ln(ratio)/ln(1+UpStep). Set 1 for pure AIMD. See Config.SlowStartGain.
+	SlowStartGain float64
 	// Deadband is the hold band around the target latency, as a fraction of it.
 	Deadband float64
 
@@ -116,6 +121,7 @@ func NewConcurrency(cc ConcurrencyConfig) *ConcurrencyLimiter {
 		Gain:             cc.Gain,
 		UpStep:           cc.UpStep,
 		DownStep:         cc.DownStep,
+		SlowStartGain:    cc.SlowStartGain,
 		Deadband:         cc.Deadband,
 		Classify:         cc.Classify,
 		Clock:            cc.Clock,

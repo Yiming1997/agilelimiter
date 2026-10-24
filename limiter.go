@@ -13,9 +13,10 @@ type Config struct {
 	// MaxRate is the *hard ceiling* you are willing to promise.
 	MinRate int
 	MaxRate int
-	// InitialRate is the starting rate. Cold-start low and let the controller
-	// ramp up — starting at MaxRate risks hitting the downstream before the
-	// first feedback arrives.
+	// InitialRate is the starting rate. When zero it is derived from MaxRate
+	// (MaxRate/8, at least MinRate) rather than set to MinRate: the controller
+	// comes down fast and goes up slowly, so guessing high costs a couple of
+	// ticks while guessing low costs ln(MaxRate/MinRate) of them.
 	InitialRate int
 	// Per is the time window the rate is expressed over. Default: one second.
 	Per time.Duration
@@ -53,6 +54,19 @@ type Config struct {
 	// faster than up). E.g. 0.05 up, 0.30 down.
 	UpStep   float64
 	DownStep float64
+
+	// SlowStartGain is the multiplicative increase used while the controller has
+	// never yet had to back off — i.e. while it does not know where the knee is.
+	// The default 2.0 doubles each tick, so reaching MaxRate costs
+	// log2(MaxRate/InitialRate) ticks instead of ln(MaxRate/MinRate)/ln(1+UpStep).
+	// With 10 -> 500 and a 1s tick that is 6 ticks instead of 80. This is TCP's
+	// slow start for the same reason: the asymmetry that makes additive increase
+	// safe — backing off is 6x faster than probing up — is also what makes
+	// starting slow unnecessarily expensive.
+	//
+	// Overshoot costs one or two ticks (DownStep is 0.30), so the risk is
+	// bounded; set 1 to get pure AIMD from the first tick.
+	SlowStartGain float64
 	// Deadband is the hold band around the target latency, as a fraction of it.
 	Deadband float64
 
@@ -107,7 +121,10 @@ func withDefaults(c Config) Config {
 		c.MaxRate = c.MinRate
 	}
 	if c.InitialRate <= 0 {
-		c.InitialRate = c.MinRate
+		// Start at a fraction of the ceiling, not at the floor. Coming down from
+		// too high costs about a seventh of what coming up from too low does, and
+		// slow start finds the knee in a handful of ticks either way.
+		c.InitialRate = c.MaxRate / 8
 	}
 	if c.InitialRate < c.MinRate {
 		c.InitialRate = c.MinRate
@@ -144,6 +161,9 @@ func withDefaults(c Config) Config {
 	}
 	if c.DownStep <= 0 {
 		c.DownStep = 0.30
+	}
+	if c.SlowStartGain <= 0 {
+		c.SlowStartGain = 2.0
 	}
 	if c.Deadband <= 0 {
 		c.Deadband = 0.05
@@ -312,6 +332,13 @@ type Stats struct {
 	Samples uint64
 	P50     time.Duration
 	P99     time.Duration
+
+	// ColdStart is true until the controller has had to back off once (or has
+	// saturated at MaxRate). While it is true the controller doubles each healthy
+	// tick instead of adding UpStep: it is still looking for the knee. The flag
+	// never resets for the life of the limiter, so a recovery from an outage is
+	// an ordinary additive ramp, not a second slow start.
+	ColdStart bool
 }
 
 // Stats returns a snapshot of the controller's internal signals.

@@ -235,7 +235,8 @@ Each tick:
 1. Take p50/p99 from the per-tick histogram.
 2. Update `fast` (short half-life) and `slow` (long half-life) EWMAs of p50.
 3. Compare `fast` against a window around the tolerated latency
-   `high = slow * (1 + TargetInflation)`, `low = high * (1 - Deadband)`:
+   `high = slow * (1 + TargetInflation)`, `low = high * (1 - Deadband)` — or
+   against `0.8 * SLOTarget` outright under `AnchorSLO` (see below):
    - `fast <= low` → healthy, probe up: `+UpStep`, or `×SlowStartGain` while the
      limiter has never seen congestion (cold start — see below).
    - `fast >= high` → congested, proportional decrease `1 - Gain*(excess/high)`,
@@ -249,13 +250,121 @@ It is friendlier to the downstream and resists oscillation around the knee. The
 baseline EWMA itself is also asymmetric — it falls quickly and rises slowly (see
 Pitfalls).
 
-**Cold start is the one exception.** Before the first backoff the controller does
-not know where the knee is, so `+5%/tick` is guessing very slowly: 10→500 costs 80
-ticks. It doubles instead (`SlowStartGain`, default 2.0), which costs 6. The
-asymmetry above is exactly what makes this safe — overshooting costs two ticks to
-correct, undershooting costs eighty. The flag clears on the first backoff (or at
-`MaxRate`) and never re-arms, so recovery from an outage is still an ordinary
-AIMD ramp.
+**Multiplicative probing happens in two cases.** Before the first backoff the
+controller does not know where the knee is, so `+5%/tick` is guessing very slowly:
+10→500 costs 80 ticks. It doubles instead (`SlowStartGain`, default 2.0), which
+costs 6. The asymmetry above is exactly what makes this safe — overshooting costs
+two ticks to correct, undershooting costs eighty.
+
+The cold-start flag clears on the first backoff and never re-arms, which would
+leave a limiter at `MinRate` climbing at `UpStep`: a dip that took 8 ticks to
+fall into would take 80 to climb out of. `Config.RecoverRamp` is the opt-in
+answer — set it to 0.5 and the multiplicative probe returns whenever the measured
+latency sits at or below *half* the tolerated window. It is **off by default**,
+and the matrix below shows why: it turns 25 req/s into 52 when capacity comes
+back, and 59 into 46 when capacity drops, because doubling is also how you
+overshoot a cliff.
+
+## Choosing what "congested" is measured against
+
+`Config.Anchor` decides the threshold, and it changes what the controller
+optimizes:
+
+| | `AnchorBaseline` (default) | `AnchorSLO` |
+|---|---|---|
+| Threshold | `(1+TargetInflation) x baseline`, capped at `0.8 x SLOTarget` | `0.8 x SLOTarget`, flat |
+| Optimizing for | the latency knee | goodput subject to the SLO |
+| A benign rise | backs off: 20ms -> 50ms is 2.5x the baseline | nothing, while it stays under the threshold |
+| `SLOTarget` | optional | required — falls back to `AnchorBaseline` without one |
+
+The default protects the knee, and that is the right default for a downstream
+that has one. But the SLO cap is one-way: `min()` can only *lower* the window,
+never raise it, so with a small baseline the SLO contributes nothing and the
+effective target is "2x the fastest response ever observed", whatever the SLO
+allows:
+
+```
+20ms service, 200ms SLO  ->  window = min(2 x 20ms, 160ms) = 40ms
+```
+
+A healthy-but-slower 50ms period is 2.5x that baseline, so the rate walks down
+to `MinRate` and stays: the baseline may only climb `MaxBaselineRise` per tick
+(~12%/min at the defaults) and the ramp back is `UpStep` per tick. On a virtual
+clock that is 500 -> 10 req/s in 26 ticks, and 88 ticks to return
+(`TestBaselineAnchorCollapsesOnBenignRise`). `AnchorSLO` reads 50ms against a
+160ms threshold and does not move (`TestSLOAnchorIgnoresBenignRise`).
+
+What it costs: the absolute controller keeps probing while the SLO has headroom,
+so it will not find a knee that sits below the SLO. If your downstream degrades
+sharply before its own latency target, keep the relative anchor — or keep it and
+set `MaxRate` to the knee instead.
+
+Head-to-head against `go.uber.org/ratelimit` (`cd compare && go test -run
+TestSLOAnchorVsUber -v`), 20s runs, a downstream that answers 20ms and then
+20ms -> 70ms at t=5s with capacity held at 150 req/s and a 100ms SLO:
+
+| | achieved/s | goodput/s | %<=SLO | final rate |
+|---|---:|---:|---:|---:|
+| `uber(100)` fixed rate | 102 | 102 | 100% | 100 |
+| `AnchorBaseline`, 2x (default) | 48 | 48 | 100% | **5** |
+| `AnchorBaseline`, 3.5x | 99 | 99 | 100% | 112 |
+| `AnchorSLO` | 99 | 99 | 100% | 109 |
+
+The default law spends the rest of the run at `MinRate` on a latency that never
+breaks the SLO. When capacity really drops (150 -> 40 req/s) the picture
+reverses and the SLO anchor is the one that behaves: it settles at ~39 req/s
+with 83% of requests inside the SLO, while the fixed rate keeps sending 100/s
+into 40/s (619ms mean, 40% inside).
+
+`TestSLOAnchorMatrix` runs the same comparison over seven scenarios — steady,
+benign bump, an SLO that really breaks, capacity dropping, capacity recovering,
+flapping latency and a diurnal curve — two rounds each, and prints a summary of
+which arm held up where (`cd compare && go test -run TestSLOAnchorMatrix -v
+-timeout 40m`). Goodput/s, best in bold:
+
+| scenario | uber(60) | uber(100) | uber(140) | 2x | SLO |
+|---|---:|---:|---:|---:|---:|
+| steady, capacity unknown (150/s) | 76 | 116 | **156** | 115 | 115 |
+| benign bump 20 -> 60ms | 76 | **116** | 58 | 108 | 109 |
+| SLO breaks 20 -> 150ms | 25 | 42 | 58 | 38 | 38 |
+| capacity drops 150 -> 40/s | 25 | 42 | 58 | **59** | 58 |
+| capacity recovers 40 -> 150/s | 52 | 75 | **98** | 25 | 25 |
+| flapping latency 20 <-> 70ms | 76 | **116** | 85 | 100 | 113 |
+| diurnal 100 +/- 60/s | **58** | 56 | 33 | 58 | 57 |
+
+Read `%<=SLO` alongside goodput, not goodput alone. What it says:
+
+- **No arm holds everywhere.** A fixed rate is excellent while capacity is what
+  it was and poor the moment it moves: `uber(100)` is at 52% inside the SLO on
+  the diurnal curve and 38% when capacity drops, and `uber(140)` drops to 38% on
+  a benign 20 -> 60ms bump.
+- **The adaptive arms stay inside the SLO across the board** (78-95%) without
+  being told the capacity. That is what the trade buys.
+- **Their weak spot is recovery, not backoff.** 40 -> 150 req/s costs them the
+  scenario outright (25 vs 98), because `coldStart` does not re-arm and the
+  climb is `UpStep` per tick. `Config.RecoverRamp` is the opt-in answer: at 0.5
+  that scenario goes 25 -> 52, and the capacity-drop one goes 59 -> 46, because
+  doubling is also how you overshoot a cliff. It ships off for that reason.
+- `AnchorSLO` is the steadier of the two modes (flapping latency: 112-113 req/s
+  in both rounds, against 95-105), and it is the one that survives a benign bump
+  once the SLO has real headroom.
+
+One caveat on the model: it prices load from the limiter's *target* rate, so a
+fixed-rate arm that actually completes 1.1-1.5x its nominal value is priced as
+if it sent exactly that. That flatters the uber rows slightly.
+
+### Time hysteresis: `BackoffTicks` / `RecoverTicks`
+
+Both anchors move the rate on a single tick. `BackoffTicks` and `RecoverTicks`
+require that many *consecutive* ticks to agree before a step is spent — CoDel's
+interval, reduced to a counter. Defaults are 1/1 under `AnchorBaseline` (the
+historical behaviour) and 2/2 under `AnchorSLO`, where the threshold is fixed and
+jitter across it is the main false-positive risk.
+
+This is not just smoothing. The steps are asymmetric (-30% down, +5% up), so a
+noisy signal does not average out — one bad tick and one good tick *ratchet* the
+rate down. Requiring agreement is what stops that. A tick inside the deadband
+resets both counters, so the agreement has to be in a row, not merely cumulative.
 
 ## Inbound: protecting your own service (concurrency limiting)
 
@@ -444,11 +553,12 @@ These are properties of the control law and of the deployment, not of the signal
   outruns it.
 - **Cold start and recovery.** A *fresh* limiter doubles while it has never seen
   congestion (`SlowStartGain`, default 2.0), so it finds the knee in
-  `log2(MaxRate/InitialRate)` ticks — 6 instead of 80 for 10→500. A limiter that
-  has already backed off ramps at `UpStep`, so **recovery after a deep dip is
-  still slow** (`ln(MaxLimit/MinLimit)` ticks): the flag never re-arms, which is
-  what keeps AIMD's conservatism intact. Persisting the last good limit across
-  restarts is the fix for the remaining case.
+  `log2(MaxRate/InitialRate)` ticks — 6 instead of 80 for 10→500. Recovery from a
+  deep dip is the same shape (`RecoverRamp`): once the observed latency is at or
+  below half the tolerated window the multiplicative probe returns, because
+  nothing about that reading is ambiguous. What is left to you is a limiter that
+  *restarts* cold and has to re-learn a knee it already knew — persist the last
+  good rate across restarts for that.
 - **A cache going cold.** That is a step change; the backstop is single-flight and
   sizing `MaxRate` for a *cold* origin, not a better classifier.
 - **Many instances.** Each process converges on its own; there is no shared view

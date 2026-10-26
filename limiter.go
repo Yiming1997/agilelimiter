@@ -7,6 +7,35 @@ import (
 	"time"
 )
 
+// Anchor selects what the congestion threshold is measured against.
+type Anchor int
+
+const (
+	// AnchorBaseline is the relative controller: back off when recent latency
+	// rises above (1+TargetInflation) x the *fastest latency this downstream has
+	// been seen to produce*. It protects the knee of the latency curve and needs
+	// no SLO, but it has no notion of how much SLO headroom is left: a downstream
+	// answering in 20ms that degrades to 50ms is 2.5x its own baseline, so the
+	// default law backs off to MinRate even though 50ms may be a quarter of the
+	// SLO, and it then stays there for minutes (MinRate -> MaxRate at UpStep per
+	// tick). See docs/design.md §9.
+	AnchorBaseline Anchor = iota
+
+	// AnchorSLO is the absolute controller: the backoff threshold is
+	// sloWindowFraction x SLOTarget and nothing else, so a latency rise that
+	// stays well inside the SLO costs nothing. The healthy baseline is still
+	// tracked (Stats, outage anchoring) but it never decides a backoff.
+	//
+	// The trade-off is the mirror image: it keeps probing up while the SLO has
+	// headroom, so it cannot find a knee that sits below the SLO. Use it when the
+	// SLO is the contract and the downstream degrades gracefully until it, which
+	// is the usual case for a dependency with a published latency target.
+	//
+	// Requires SLOTarget > 0; with no SLO configured it degrades to
+	// AnchorBaseline.
+	AnchorSLO
+)
+
 // Config configures a Limiter. Zero fields take sensible defaults (see withDefaults).
 type Config struct {
 	// MinRate and MaxRate bound the dynamic rate, in requests per second.
@@ -23,7 +52,18 @@ type Config struct {
 
 	// SLOTarget enables the tail-latency guard: when the per-tick p99 exceeds
 	// it, the controller forces a full backoff step. Zero disables the guard.
+	//
+	// It plays two other roles: it caps the relative window from above (the
+	// controller never aims past sloWindowFraction x SLOTarget), and under
+	// AnchorSLO it *is* the window. The guard itself stays ungated by
+	// BackoffTicks: a tail that blows through the SLO is a safety valve, and
+	// delaying it one tick is not worth the noise it would filter.
 	SLOTarget time.Duration
+
+	// Anchor chooses what the backoff threshold is measured against: the
+	// downstream's own fastest latency (the default) or the absolute SLO. See
+	// Anchor for what each one buys and costs.
+	Anchor Anchor
 
 	// EWMA half-lives for the control signal.
 	FastHalfLife     time.Duration // recent latency
@@ -69,6 +109,44 @@ type Config struct {
 	SlowStartGain float64
 	// Deadband is the hold band around the target latency, as a fraction of it.
 	Deadband float64
+
+	// BackoffTicks and RecoverTicks are the time hysteresis: the rate only moves
+	// after that many *consecutive* ticks agree about which side of the window
+	// the latency is on. This is CoDel's interval idea reduced to a counter, and
+	// it is the cheapest defence against a noisy signal: with the asymmetric
+	// steps (-DownStep vs +UpStep) a single-tick spike and a single-tick dip do
+	// not cancel out — they ratchet the rate down — so filtering them by
+	// agreement matters more than the size of the steps.
+	//
+	// A tick in the deadband resets both counters: the two sides must agree in a
+	// row, not merely add up.
+	//
+	// Zero takes the default: 1 (no hysteresis, the historical behaviour) under
+	// AnchorBaseline, and 2 under AnchorSLO, where the threshold is fixed and
+	// jitter across it is therefore the main false-positive risk.
+	BackoffTicks int
+	RecoverTicks int
+
+	// RecoverRamp is how far below the tolerated latency the observed latency
+	// has to be — and for how long — before the controller may probe
+	// multiplicatively again, even though it has already seen congestion.
+	//
+	// It exists for one case: the downstream came back. After a deep dip the rate
+	// sits at MinRate and the climb is UpStep per tick, so 5 -> 120 costs about
+	// 65 ticks — while SlowStartGain, which would do it in 5, is reserved for a
+	// limiter that has never seen congestion.
+	//
+	// It is **off by default** (0), and that is deliberate. Doubling is how you
+	// overshoot, and overshooting a downstream whose latency curve is a cliff is
+	// expensive: in the scenario matrix it buys 25 -> 52 req/s of goodput when
+	// capacity comes back, and costs 59 -> 46 when capacity drops, because the
+	// ramp walks straight back into the cliff. Turning it on is a statement that
+	// your downstream degrades gracefully and is more likely to recover than to
+	// fall further.
+	//
+	// 0.5 means "at most half the tolerated latency". 1.0 makes every healthy
+	// tick a multiplicative probe.
+	RecoverRamp float64
 
 	// Classify maps a failed call to what the controller is told about it. It is
 	// only consulted for non-nil errors; a nil error always means Reached.
@@ -167,6 +245,26 @@ func withDefaults(c Config) Config {
 	}
 	if c.Deadband <= 0 {
 		c.Deadband = 0.05
+	}
+	if c.Anchor == AnchorSLO && c.SLOTarget <= 0 {
+		// The absolute window is derived from the SLO, so without one there is
+		// nothing to anchor to. Falling back beats a window of zero.
+		c.Anchor = AnchorBaseline
+	}
+	if c.BackoffTicks <= 0 {
+		c.BackoffTicks = 1
+		if c.Anchor == AnchorSLO {
+			c.BackoffTicks = 2
+		}
+	}
+	if c.RecoverTicks <= 0 {
+		c.RecoverTicks = 1
+		if c.Anchor == AnchorSLO {
+			c.RecoverTicks = 2
+		}
+	}
+	if c.RecoverRamp < 0 {
+		c.RecoverRamp = 0 // negative is meaningless; zero (the default) is "off"
 	}
 	if c.Clock == nil {
 		c.Clock = realClock{}

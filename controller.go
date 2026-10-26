@@ -46,6 +46,11 @@ type controller struct {
 	// SlowStartGain field for why the asymmetry justifies this.
 	coldStart bool
 
+	// above/below count how many consecutive ticks the fast signal has spent on
+	// each side of the tolerated band, for the BackoffTicks/RecoverTicks
+	// hysteresis. A tick inside the band resets both.
+	above, below int
+
 	// what the last completed tick saw, for Stats
 	lastP50, lastP99 time.Duration
 	lastSamples      uint64
@@ -119,41 +124,46 @@ func (c *controller) step() {
 		c.slow += delta
 	}
 
-	// The acceptable latency window: up to (1+TargetInflation) x baseline, with
-	// a deadband around it so noise in the hold zone doesn't move the rate.
-	high := c.slow * (1 + c.cfg.TargetInflation)
+	// The acceptable latency band for this tick. Which anchor it is measured
+	// against — and therefore how much of the SLO's headroom it leaves — is the
+	// one thing Anchor changes.
+	high, low := c.window()
 
-	// The window can never be allowed to aim above the SLO: targeting a latency
-	// the SLO will reject is self-defeating by construction, and it is what makes
-	// a permissive TargetInflation (the 1.0 default tolerates 2x baseline) park
-	// the controller on the SLO boundary, where ordinary jitter pushes half the
-	// requests over it. Capping at a fraction of the SLO keeps the two knobs
-	// consistent instead of leaving them to be reconciled by hand.
-	if c.cfg.SLOTarget > 0 {
-		if cap := float64(c.cfg.SLOTarget) * sloWindowFraction; high > cap {
-			high = cap
-		}
-	}
-	low := high * (1 - c.cfg.Deadband)
-
-	var factor float64
+	// A step needs BackoffTicks/RecoverTicks consecutive ticks on the same side
+	// of the band: one tick of jitter then costs nothing. This matters more than
+	// the size of the steps, because the steps are asymmetric (-30% vs +5%), so
+	// an alternating signal does not cancel out — it ratchets the rate down.
+	var factor float64 = 1
 	switch {
 	case c.fast <= low:
-		// Healthy: probe up. Additively, unless we have never seen congestion —
-		// then we do not know where the knee is and doubling finds it in log2
-		// ticks. Overshooting on the way up is cheap (DownStep is 0.30, so two
-		// ticks bring us back); undershooting is not (UpStep is 0.05).
-		if c.coldStart && c.cfg.SlowStartGain > 1 {
+		c.below++
+		c.above = 0
+		if c.below < c.cfg.RecoverTicks {
+			break // not yet enough agreement to spend a probe
+		}
+		// Healthy: probe up. Additively, unless a multiplicative probe is
+		// warranted — either because we have never seen congestion (we do not know
+		// where the knee is, so doubling finds it in log2 ticks), or because the
+		// latency has come back to half the tolerated window (we know exactly
+		// where the knee is, and we are nowhere near it). Overshooting on the way
+		// up is cheap (DownStep is 0.30, so two ticks bring us back);
+		// undershooting is not (UpStep is 0.05).
+		if c.rampUp(high) {
 			factor = c.cfg.SlowStartGain
 		} else {
 			factor = 1 + c.cfg.UpStep
 		}
 	case c.fast >= high:
+		c.above++
+		c.below = 0
+		if c.above < c.cfg.BackoffTicks {
+			break // not yet enough agreement to spend a step
+		}
 		over := (c.fast - high) / high
 		factor = 1 - math.Min(c.cfg.DownStep, c.cfg.Gain*over)
 		c.coldStart = false // we found the knee; ordinary AIMD from here on
 	default:
-		factor = 1 // within the band: hold
+		c.above, c.below = 0, 0 // within the band: hold
 	}
 
 	// Tail guard: if the worst-case latency blows past the SLO, force a full
@@ -177,6 +187,66 @@ func (c *controller) step() {
 		c.coldStart = false // nothing left to discover up there
 	}
 	c.setRate(int(math.Round(c.rate)))
+}
+
+// rampUp reports whether this healthy tick should probe multiplicatively rather
+// than additively.
+//
+// Two cases qualify. Cold start: the limiter has never seen congestion, so it
+// has no idea where the knee is. The other is recovery, and it is opt-in: the
+// observed latency is at or below RecoverRamp of the tolerated window, which
+// means the downstream is not merely healthy but far from the knee — the
+// situation after it comes back from an outage, when an additive ramp would
+// take ln(MaxRate/MinRate) ticks to undo a backoff that took a handful.
+//
+// The recovery case is off by default (RecoverRamp == 0) because doubling is
+// also how you overshoot, and overshooting a downstream whose latency curve is
+// a cliff is expensive. See Config.RecoverRamp for the measured trade-off.
+func (c *controller) rampUp(high float64) bool {
+	if c.cfg.SlowStartGain <= 1 {
+		return false
+	}
+	return c.coldStart || c.fast <= high*c.cfg.RecoverRamp
+}
+
+// window returns the tolerated latency band for this tick, as absolute
+// nanoseconds.
+//
+// Under AnchorBaseline the band moves with the healthy baseline — up to
+// (1+TargetInflation) x baseline, with a deadband under it so noise in the hold
+// zone does not move the rate — and the SLO caps it from above.
+//
+// That cap is not symmetric, and the asymmetry is the whole reason AnchorSLO
+// exists: capping can only *lower* the window, never raise it. So when the
+// baseline is small the SLO contributes nothing at all, and the controller
+// treats a latency that is still a quarter of the SLO as congestion merely
+// because it is 2.5x the fastest response the downstream ever gave. Targeting a
+// latency the SLO will reject is self-defeating by construction, so the cap
+// itself is right; what is wrong is letting the ratio decide a backoff when the
+// absolute number has plenty of room.
+//
+// Under AnchorSLO the band is sloWindowFraction x SLOTarget outright, and the
+// baseline is not consulted. The deadband still applies, so the hold zone is the
+// top 5% below the threshold rather than the whole distance to the SLO.
+func (c *controller) window() (high, low float64) {
+	ceiling := float64(0)
+	if c.cfg.SLOTarget > 0 {
+		ceiling = float64(c.cfg.SLOTarget) * sloWindowFraction
+	}
+
+	if c.cfg.Anchor == AnchorSLO && ceiling > 0 {
+		high = ceiling
+	} else {
+		high = c.slow * (1 + c.cfg.TargetInflation)
+		if ceiling > 0 && high > ceiling {
+			// Never aim above the SLO: a permissive TargetInflation (the 1.0
+			// default tolerates 2x baseline) would otherwise park the controller
+			// on the SLO boundary, where ordinary jitter pushes half the requests
+			// over it.
+			high = ceiling
+		}
+	}
+	return high, high * (1 - c.cfg.Deadband)
 }
 
 // currentRate returns the last computed rate.

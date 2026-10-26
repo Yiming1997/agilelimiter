@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"agilelimiter"
+
 	uberratelimit "go.uber.org/ratelimit"
 )
 
@@ -44,18 +45,41 @@ const (
 const maxRTT = 400 * time.Millisecond
 
 // downstream models a dependency whose response time grows as the offered rate
-// approaches its capacity.
-type downstream struct{ base time.Duration }
+// approaches its capacity, and whose idle response time may itself change over
+// the run — a downstream that got slower without anybody adding load.
+type downstream struct {
+	base func(time.Duration) time.Duration
+	// wait maps utilization (0..1) to a latency multiplier; nil means mm1.
+	wait func(util float64) float64
+	// slo is the contract a request is scored against. Zero means the package
+	// default, which is what every case in main.go uses.
+	slo time.Duration
+}
 
-func (d downstream) rtt(offered, capacity float64) time.Duration {
-	util := offered / capacity
-	if util > 0.95 { // clamp so saturation stays finite instead of dividing by zero
+// mm1 is 1/(1-util), clamped so saturation stays finite instead of dividing by
+// zero. It is the curve every case below uses: latency is already 20x the idle
+// value at 95% utilization.
+func mm1(util float64) float64 {
+	if util > 0.95 {
 		util = 0.95
 	}
 	if util < 0 {
 		util = 0
 	}
-	return time.Duration(float64(d.base) / (1 - util))
+	return 1 / (1 - util)
+}
+
+func (d downstream) rtt(offered, capacity float64, t time.Duration) time.Duration {
+	wait := d.wait
+	if wait == nil {
+		wait = mm1
+	}
+	return time.Duration(float64(d.base(t)) * wait(offered/capacity))
+}
+
+// steadyBase is an idle response time that never changes.
+func steadyBase(d time.Duration) func(time.Duration) time.Duration {
+	return func(time.Duration) time.Duration { return d }
 }
 
 // limiter is the common shape we compare across. Both adapters below present it.
@@ -117,9 +141,18 @@ type result struct {
 // run drives one limiter against one capacity schedule for `dur` and collects
 // the outcome. `pool` is the worker count.
 func run(label string, mk func() (limiter, func()), sched func(time.Duration) float64, dur time.Duration, pool int) result {
+	return runOn(label, mk, downstream{base: steadyBase(baseRTT)}, sched, dur, pool)
+}
+
+// runOn is run with a downstream of your own, so the idle latency (and the
+// shape of the queueing curve) can change over the run.
+func runOn(label string, mk func() (limiter, func()), ds downstream, sched func(time.Duration) float64, dur time.Duration, pool int) result {
 	lim, cleanup := mk()
 	defer cleanup()
-	ds := downstream{base: baseRTT}
+	target := ds.slo
+	if target == 0 {
+		target = slo
+	}
 
 	var mu sync.Mutex
 	var completed, ok int
@@ -137,7 +170,8 @@ func run(label string, mk func() (limiter, func()), sched func(time.Duration) fl
 			for time.Now().Before(deadline) {
 				lim.take()
 				start := time.Now()
-				rtt := ds.rtt(lim.rate(), sched(time.Since(begin)))
+				t := start.Sub(begin)
+				rtt := ds.rtt(lim.rate(), sched(t), t)
 				time.Sleep(rtt)
 				elapsed := time.Since(start)
 				lim.observe(elapsed)
@@ -146,7 +180,7 @@ func run(label string, mk func() (limiter, func()), sched func(time.Duration) fl
 				completed++
 				sum += elapsed
 				lats = append(lats, elapsed)
-				if elapsed <= slo {
+				if elapsed <= target {
 					ok++
 				}
 				mu.Unlock()

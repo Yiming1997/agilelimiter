@@ -30,6 +30,18 @@ type ConcurrencyConfig struct {
 	// it, the controller forces a full backoff step. Zero disables the guard.
 	SLOTarget time.Duration
 
+	// Anchor chooses what the backoff threshold is measured against. See
+	// Config.Anchor: AnchorSLO measures against the SLO itself, so a benign rise
+	// in handling time that stays inside it costs no concurrency.
+	Anchor Anchor
+
+	// BackoffTicks and RecoverTicks are the time hysteresis (see Config).
+	BackoffTicks int
+	RecoverTicks int
+	// RecoverRamp is how far below the tolerated latency the observed latency has
+	// to be before a multiplicative probe is allowed again (see Config).
+	RecoverRamp float64
+
 	// EWMA half-lives for the control signal.
 	FastHalfLife     time.Duration // recent latency
 	SlowHalfLife     time.Duration // healthy baseline (creeps up slowly)
@@ -112,6 +124,10 @@ func NewConcurrency(cc ConcurrencyConfig) *ConcurrencyLimiter {
 		MaxRate:          cc.MaxLimit,
 		InitialRate:      cc.InitialLimit,
 		SLOTarget:        cc.SLOTarget,
+		Anchor:           cc.Anchor,
+		BackoffTicks:     cc.BackoffTicks,
+		RecoverTicks:     cc.RecoverTicks,
+		RecoverRamp:      cc.RecoverRamp,
 		FastHalfLife:     cc.FastHalfLife,
 		SlowHalfLife:     cc.SlowHalfLife,
 		SlowDownHalfLife: cc.SlowDownHalfLife,

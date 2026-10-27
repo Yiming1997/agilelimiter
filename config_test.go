@@ -146,3 +146,57 @@ func TestConcurrencyPresetAndValidate(t *testing.T) {
 		t.Fatal("a zero MaxLimit must be rejected")
 	}
 }
+
+// TailFactor moves the guard's threshold without touching the window cap or the
+// anchor: 10% of requests at 150ms must not burn the rate when the guard is set
+// to 2x, and must burn it when the guard sits on the SLO itself.
+func TestTailFactorWidensTheGuard(t *testing.T) {
+	finalRate := func(factor float64) float64 {
+		l := New(Config{
+			MinRate:     10,
+			MaxRate:     1000,
+			InitialRate: 500,
+			SLOTarget:   100 * time.Millisecond,
+			TailFactor:  factor,
+		})
+		for i := 0; i < 5; i++ {
+			for j := 0; j < 90; j++ {
+				l.Observe(10 * time.Millisecond)
+			}
+			for j := 0; j < 10; j++ {
+				l.Observe(150 * time.Millisecond)
+			}
+			l.ctrl.step()
+		}
+		return l.Rate()
+	}
+
+	if tight := finalRate(1); tight >= 500 {
+		t.Fatalf("a guard pinned at the SLO must fire on a 150ms tail, rate=%v", tight)
+	}
+	if wide := finalRate(2); wide < 500 {
+		t.Fatalf("a 2x guard must ignore a 150ms tail when the SLO is 100ms, rate=%v", wide)
+	}
+}
+
+func TestTailFactorDefaults(t *testing.T) {
+	if got := withDefaults(Config{MinRate: 1, MaxRate: 10}).TailFactor; got != 1 {
+		t.Fatalf("TailFactor = %v, want 1 (the historical behaviour)", got)
+	}
+}
+
+func TestResolvedDescribesTheGuard(t *testing.T) {
+	r := New(Config{MaxRate: 120, SLOTarget: 100 * time.Millisecond, TailFactor: 2}).Config()
+	if r.Tail != "200ms (2.0x SLOTarget)" {
+		t.Fatalf("Tail = %q", r.Tail)
+	}
+	// The window cap is untouched by TailFactor.
+	if r.Window != "2.00x baseline, capped at 80ms" {
+		t.Fatalf("Window = %q", r.Window)
+	}
+
+	off := New(Config{MaxRate: 120}).Config()
+	if off.Tail != "off (SLOTarget unset)" {
+		t.Fatalf("Tail = %q", off.Tail)
+	}
+}

@@ -38,6 +38,9 @@ type ConcurrencyConfig struct {
 	// in handling time that stays inside it costs no concurrency.
 	Anchor Anchor
 
+	// TailFactor scales SLOTarget for the p99 guard only (see Config.TailFactor).
+	TailFactor float64
+
 	// BackoffTicks and RecoverTicks are the time hysteresis (see Config).
 	BackoffTicks int
 	RecoverTicks int
@@ -124,6 +127,7 @@ func (cc ConcurrencyConfig) toConfig() Config {
 		MaxRate:          cc.MaxLimit,
 		InitialRate:      cc.InitialLimit,
 		SLOTarget:        cc.SLOTarget,
+		TailFactor:       cc.TailFactor,
 		Anchor:           cc.Anchor,
 		BackoffTicks:     cc.BackoffTicks,
 		RecoverTicks:     cc.RecoverTicks,

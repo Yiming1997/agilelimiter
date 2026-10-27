@@ -268,7 +268,7 @@ Each tick:
    - `fast >= high` → congested, proportional decrease `1 - Gain*(excess/high)`,
      capped at `-DownStep`.
    - in between → hold (deadband).
-4. If p99 exceeds `SLOTarget`, force a full `-DownStep`.
+4. If p99 exceeds `SLOTarget x TailFactor`, force a full `-DownStep`.
 5. Clamp to `[MinRate, MaxRate]` and push to the bucket.
 
 **Asymmetry is intentional**: back off fast (30%/tick), ramp up slowly (5%/tick).
@@ -614,12 +614,18 @@ collapsed, the median law said *healthy*: a constant offset moves `fast` and
 does, and it turns a polluted sample into a 30%-per-tick backoff straight to
 `MinRate`.
 
-**`SLOTarget` is not the SLO you promise.** A SLO is a fraction over a long
-window ("99% of requests under 200ms"); the guard compares *one tick's* p99
-against this number. A service that exactly meets its own SLO crosses that line
-on roughly half its ticks, and half the ticks is enough to walk the rate to the
-floor, because `0.70 x 1.05 < 1`. Set it at 1.5-2x the p99 you normally see,
-not at the number you write in the contract.
+**The guard compares one tick's p99 against `SLOTarget`.** A SLO is a fraction
+over a long window ("99% of requests under 200ms"); a per-tick p99 crossing that
+number is *normal* for a service that meets it — roughly half the ticks. And half
+the ticks is enough to walk the rate to the floor, because `0.70 x 1.05 < 1`.
+Measured on a downstream with no queueing at all: 5% of requests that always cost
+300ms took 300 req/s to 21.
+
+`TailFactor` (default 1.0 — the guard fires at the SLO itself) moves that
+threshold and nothing else. Set it to 1.5–2 when your tail is made of different
+request types rather than of queueing: `SLOTarget` stays the number in the
+contract, the window cap and the `AnchorSLO` target stay where they are, and only
+the guard gets room.
 
 The shape of the fix is always the same — decide what the number means *before*
 it reaches `Observe`:

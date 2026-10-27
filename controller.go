@@ -175,7 +175,7 @@ func (c *controller) step() {
 	// That is the honest meaning of a 99th percentile over ten samples, not a
 	// bug: if you want the guard to need a real tail, give it more samples per
 	// tick by raising Tick.
-	if c.cfg.SLOTarget > 0 && p99 > c.cfg.SLOTarget {
+	if tail := c.tailTarget(); tail > 0 && p99 > tail {
 		if floor := 1 - c.cfg.DownStep; factor > floor {
 			factor = floor
 		}
@@ -207,6 +207,27 @@ func (c *controller) rampUp(high float64) bool {
 		return false
 	}
 	return c.coldStart || c.fast <= high*c.cfg.RecoverRamp
+}
+
+// tailTarget is the latency at which the p99 guard fires, or zero when the guard
+// is off.
+//
+// It is SLOTarget scaled by TailFactor because SLOTarget is asked to be three
+// things at once: the window cap (0.8x SLOTarget), the AnchorSLO target, and this
+// guard's threshold — and the guard wants a larger number than the other two. A
+// per-tick p99 crossing the number you also promise as an SLO is normal for a
+// service that meets its SLO, and the guard costs -DownStep on every tick it
+// fires, so a guard pinned at 1.0x fires on about half the ticks and walks the
+// rate to MinRate. Raising SLOTarget to fix that would also widen the window and
+// move the anchor; this knob moves only the guard.
+//
+// The default factor is 1, which is the behaviour every measurement in the docs
+// was taken with: it is a knob, not a silent change of the old law.
+func (c *controller) tailTarget() time.Duration {
+	if c.cfg.SLOTarget <= 0 {
+		return 0
+	}
+	return time.Duration(float64(c.cfg.SLOTarget) * c.cfg.TailFactor)
 }
 
 // window returns the tolerated latency band for this tick, as absolute

@@ -98,6 +98,24 @@ type Config struct {
 	// also widen the window cap and move the SLO anchor.
 	TailFactor float64
 
+	// TailTolerance switches the tail guard from a quantile test to a ratio test:
+	// it fires when the smoothed fraction of requests above the tail target
+	// exceeds this number. Zero (the default) keeps the historical test, "is the
+	// per-tick p99 above the target".
+	//
+	// The ratio test exists because a quantile cannot tell a heterogeneous
+	// population from queueing: 5% of requests that are simply a different
+	// endpoint put the p99 permanently above the target, and the guard then takes
+	// -30% per tick until the rate is at MinRate — measured on a downstream with no
+	// queueing at all, 300 -> 21 req/s. A ratio says "5% was slow", which against
+	// a 10% tolerance is not congestion; when the whole tick is slow the ratio is
+	// 100% and the guard fires as before.
+	//
+	// 0.05-0.10 is the useful range: it is the share of traffic you are willing to
+	// see above the target. The ratio is smoothed over about two ticks, so one slow
+	// request in a quiet tick decays instead of punishing the rate.
+	TailTolerance float64
+
 	// Anchor chooses what the backoff threshold is measured against: the
 	// downstream's own fastest latency (the default) or the absolute SLO. See
 	// Anchor for what each one buys and costs.
@@ -396,6 +414,9 @@ func withDefaults(c Config) Config {
 	if c.TailFactor <= 0 {
 		c.TailFactor = 1 // the guard fires at the SLO, which is the historical behaviour
 	}
+	if c.TailTolerance < 0 {
+		c.TailTolerance = 0 // a negative tolerance is meaningless; zero means "quantile mode"
+	}
 	if c.Clock == nil {
 		c.Clock = realClock{}
 	}
@@ -561,6 +582,14 @@ type Stats struct {
 	P50     time.Duration
 	P99     time.Duration
 
+	// TailRatio is the smoothed fraction of this tick's requests that were above
+	// the tail target. It is the number the ratio-mode guard compares against
+	// TailTolerance, and it stays zero unless TailTolerance is set.
+	//
+	// Export it: a non-zero TailRatio with a rate that is not moving tells you the
+	// guard is at its threshold and the population, not the load, is deciding.
+	TailRatio float64
+
 	// ColdStart is true until the controller has had to back off once (or has
 	// saturated at MaxRate). While it is true the controller doubles each healthy
 	// tick instead of adding UpStep: it is still looking for the knee. The flag
@@ -631,6 +660,9 @@ type Resolved struct {
 	// "off (SLOTarget unset)".
 	Tail       string
 	TailFactor float64
+	// TailTolerance is the ratio-mode threshold; zero means the guard is in
+	// quantile mode (the historical behaviour).
+	TailTolerance float64
 
 	Tick             time.Duration
 	FastHalfLife     time.Duration
@@ -667,6 +699,7 @@ func resolve(cfg Config, kind string) Resolved {
 		Per:              cfg.Per,
 		SLOTarget:        cfg.SLOTarget,
 		TailFactor:       cfg.TailFactor,
+		TailTolerance:    cfg.TailTolerance,
 		Tick:             cfg.Tick,
 		FastHalfLife:     cfg.FastHalfLife,
 		SlowHalfLife:     cfg.SlowHalfLife,
@@ -703,8 +736,13 @@ func resolve(cfg Config, kind string) Resolved {
 	if cfg.SLOTarget <= 0 {
 		r.Tail = "off (SLOTarget unset)"
 	} else {
-		r.Tail = fmt.Sprintf("%s (%.1fx SLOTarget)",
-			time.Duration(float64(cfg.SLOTarget)*cfg.TailFactor), cfg.TailFactor)
+		target := time.Duration(float64(cfg.SLOTarget) * cfg.TailFactor)
+		if cfg.TailTolerance > 0 {
+			r.Tail = fmt.Sprintf("%.0f%% of requests above %s (%.1fx SLOTarget)",
+				cfg.TailTolerance*100, target, cfg.TailFactor)
+		} else {
+			r.Tail = fmt.Sprintf("p99 > %s (%.1fx SLOTarget)", target, cfg.TailFactor)
+		}
 	}
 	return r
 }
@@ -743,6 +781,9 @@ func (c Config) Validate() error {
 	}
 	if c.TailFactor != 0 && c.TailFactor < 1 {
 		add("TailFactor %.2f must be at least 1: the guard would fire before the latency you called unacceptable", c.TailFactor)
+	}
+	if c.TailTolerance < 0 || c.TailTolerance >= 1 {
+		add("TailTolerance %.2f must be within [0, 1): 1 means every request may be slow", c.TailTolerance)
 	}
 	if c.Tick < 0 || c.Tick > 10*time.Second {
 		add("Tick %s must be within (0s, 10s]", c.Tick)

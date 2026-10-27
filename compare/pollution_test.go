@@ -108,6 +108,55 @@ func agilePolluted() (limiter, func()) {
 	return &agileLim{l: l}, l.Stop
 }
 
+// agileTolerance is the shipped law with the ratio-mode tail guard.
+func agileTolerance(tol float64) func() (limiter, func()) {
+	return func() (limiter, func()) {
+		l := agilelimiter.New(agilelimiter.Config{
+			MinRate:       pollMin,
+			MaxRate:       pollCeiling,
+			InitialRate:   pollInit,
+			SLOTarget:     pollSLO,
+			TailTolerance: tol,
+			FastHalfLife:  750 * time.Millisecond,
+			SlowHalfLife:  45 * time.Second,
+			Tick:          250 * time.Millisecond,
+		})
+		l.Start()
+		return &agileLim{l: l}, l.Stop
+	}
+}
+
+// TestTailTolerance is the fix under test: the guard compares a *fraction* of the
+// population against a tolerance instead of comparing one order statistic against
+// a threshold. A fixed cohort should stop costing the rate; a real blowout should
+// still be caught.
+func TestTailTolerance(t *testing.T) {
+	cohort := withSlowCohort(flatLatency(24*time.Millisecond), 5, 300*time.Millisecond)
+	blowout := flatLatency(300 * time.Millisecond)
+
+	fmt.Println("tail guard: quantile test vs ratio test, flat downstream again")
+	fmt.Printf("limiter: MinRate %d, MaxRate %d, SLOTarget %s; one %s run per arm\n",
+		pollMin, pollCeiling, pollSLO, pollDur)
+	fmt.Println()
+	fmt.Println("tol 0   = the historical test: one slow sample in the tick fires it")
+	fmt.Println("tol 5%/10% = fire only when that share of the tick is over the target")
+
+	for _, sc := range []struct {
+		label string
+		shape func(float64, time.Duration, uint64) time.Duration
+	}{
+		{"A — 5% of requests always cost 300ms (a cohort, not congestion)", cohort},
+		{"B — every request costs 300ms (a real blowout)", blowout},
+	} {
+		rows := []result{
+			runOn("tol 0", agileTolerance(0), downstream{shape: sc.shape}, flat(pollCapacity), pollDur, 120),
+			runOn("tol 5%", agileTolerance(0.05), downstream{shape: sc.shape}, flat(pollCapacity), pollDur, 120),
+			runOn("tol 10%", agileTolerance(0.10), downstream{shape: sc.shape}, flat(pollCapacity), pollDur, 120),
+		}
+		report("=== "+sc.label+" ===", rows)
+	}
+}
+
 func TestPollution(t *testing.T) {
 	cases := []struct {
 		label string

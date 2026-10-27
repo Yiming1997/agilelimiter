@@ -51,6 +51,11 @@ type controller struct {
 	// hysteresis. A tick inside the band resets both.
 	above, below int
 
+	// over is the smoothed fraction of samples above the tail target, and
+	// overAlpha is its EWMA factor. It only exists in ratio mode.
+	over      float64
+	overAlpha float64
+
 	// what the last completed tick saw, for Stats
 	lastP50, lastP99 time.Duration
 	lastSamples      uint64
@@ -70,6 +75,9 @@ func newController(cfg Config, hist *histogram, setRate func(rate int)) *control
 		fastAlpha:     ewmaAlpha(cfg.FastHalfLife, cfg.Tick),
 		slowUpAlpha:   ewmaAlpha(cfg.SlowHalfLife, cfg.Tick),
 		slowDownAlpha: ewmaAlpha(cfg.SlowDownHalfLife, cfg.Tick),
+		// Two ticks: short enough to react to a sudden blowout, long enough that
+		// one slow sample in a quiet tick decays instead of repeating.
+		overAlpha: ewmaAlpha(2*cfg.Tick, cfg.Tick),
 	}
 }
 
@@ -88,7 +96,7 @@ func (c *controller) step() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	p50, p99, n := c.hist.snapshot()
+	p50, p99, n, above := c.hist.snapshotAbove(c.snapshotTail())
 	// Retain what this tick saw for Stats. With no samples both quantiles are
 	// zero and Samples is zero, which is how a caller can tell "the controller
 	// held its rate" apart from "the controller was blind".
@@ -166,20 +174,41 @@ func (c *controller) step() {
 		c.above, c.below = 0, 0 // within the band: hold
 	}
 
-	// Tail guard: if the worst-case latency blows past the SLO, force a full
+	// Tail guard: if the worst-case latency blows past the tail target, force a
 	// backoff step regardless of the median-based decision.
 	//
-	// Note what this is at low sample counts. quantile uses nearest-rank, so with
-	// n samples "p99" is the n-th order statistic below n=100 — i.e. the slowest
-	// sample. One slow request in a quiet tick therefore costs a full -DownStep.
-	// That is the honest meaning of a 99th percentile over ten samples, not a
-	// bug: if you want the guard to need a real tail, give it more samples per
-	// tick by raising Tick.
-	if tail := c.tailTarget(); tail > 0 && p99 > tail {
-		if floor := 1 - c.cfg.DownStep; factor > floor {
-			factor = floor
+	// Two modes, and the difference matters. With TailTolerance == 0 the test is
+	// "is the 99th percentile above the target", which at low sample counts is
+	// literally "was the slowest request of this tick above it" and which cannot
+	// tell a heterogeneous population from queueing. With a tolerance the test is
+	// "what fraction of this tick was above the target, smoothed", so 5% of
+	// requests that are simply a different endpoint no longer read as congestion,
+	// while a real blowout (most of the tick over the line) still does.
+	//
+	// The tail guard deliberately skips the BackoffTicks hysteresis: a tail that
+	// blows through the target is a safety valve, and delaying it is not worth the
+	// noise it would filter.
+	if tail := c.tailTarget(); tail > 0 {
+		switch {
+		case c.cfg.TailTolerance > 0:
+			var ratio float64
+			if n > 0 {
+				ratio = float64(above) / float64(n)
+			}
+			c.over += c.overAlpha * (ratio - c.over)
+			if c.over > c.cfg.TailTolerance {
+				excess := (c.over - c.cfg.TailTolerance) / c.cfg.TailTolerance
+				if floor := 1 - math.Min(c.cfg.DownStep, c.cfg.Gain*excess); factor > floor {
+					factor = floor
+				}
+				c.coldStart = false
+			}
+		case p99 > tail:
+			if floor := 1 - c.cfg.DownStep; factor > floor {
+				factor = floor
+			}
+			c.coldStart = false // the tail is congestion evidence too
 		}
-		c.coldStart = false // the tail is congestion evidence too
 	}
 
 	c.rate = clampRate(c.rate*factor, c.cfg.MinRate, c.cfg.MaxRate)
@@ -228,6 +257,15 @@ func (c *controller) tailTarget() time.Duration {
 		return 0
 	}
 	return time.Duration(float64(c.cfg.SLOTarget) * c.cfg.TailFactor)
+}
+
+// snapshotTail is the threshold the histogram should count observations above,
+// or zero to skip the count. Only ratio mode needs it: quantile mode reads p99.
+func (c *controller) snapshotTail() time.Duration {
+	if c.cfg.TailTolerance <= 0 {
+		return 0
+	}
+	return c.tailTarget()
 }
 
 // window returns the tolerated latency band for this tick, as absolute
@@ -288,6 +326,7 @@ func (c *controller) stats() Stats {
 		Samples:   c.lastSamples,
 		P50:       c.lastP50,
 		P99:       c.lastP99,
+		TailRatio: c.over,
 		ColdStart: c.coldStart,
 	}
 }

@@ -40,6 +40,8 @@ type ConcurrencyConfig struct {
 
 	// TailFactor scales SLOTarget for the p99 guard only (see Config.TailFactor).
 	TailFactor float64
+	// TailTolerance switches the guard to a ratio test (see Config.TailTolerance).
+	TailTolerance float64
 
 	// BackoffTicks and RecoverTicks are the time hysteresis (see Config).
 	BackoffTicks int
@@ -128,6 +130,7 @@ func (cc ConcurrencyConfig) toConfig() Config {
 		InitialRate:      cc.InitialLimit,
 		SLOTarget:        cc.SLOTarget,
 		TailFactor:       cc.TailFactor,
+		TailTolerance:    cc.TailTolerance,
 		Anchor:           cc.Anchor,
 		BackoffTicks:     cc.BackoffTicks,
 		RecoverTicks:     cc.RecoverTicks,

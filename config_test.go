@@ -187,7 +187,7 @@ func TestTailFactorDefaults(t *testing.T) {
 
 func TestResolvedDescribesTheGuard(t *testing.T) {
 	r := New(Config{MaxRate: 120, SLOTarget: 100 * time.Millisecond, TailFactor: 2}).Config()
-	if r.Tail != "200ms (2.0x SLOTarget)" {
+	if r.Tail != "p99 > 200ms (2.0x SLOTarget)" {
 		t.Fatalf("Tail = %q", r.Tail)
 	}
 	// The window cap is untouched by TailFactor.
@@ -195,8 +195,87 @@ func TestResolvedDescribesTheGuard(t *testing.T) {
 		t.Fatalf("Window = %q", r.Window)
 	}
 
+	ratio := New(Config{
+		MaxRate:       120,
+		SLOTarget:     100 * time.Millisecond,
+		TailFactor:    2,
+		TailTolerance: 0.1,
+	}).Config()
+	if ratio.Tail != "10% of requests above 200ms (2.0x SLOTarget)" {
+		t.Fatalf("Tail = %q", ratio.Tail)
+	}
+
 	off := New(Config{MaxRate: 120}).Config()
 	if off.Tail != "off (SLOTarget unset)" {
 		t.Fatalf("Tail = %q", off.Tail)
+	}
+}
+
+// A fixed cohort is not congestion: 5% of requests at 300ms must leave the rate
+// alone when the tolerance is 10%, and must burn it when the guard is the plain
+// p99 test.
+func TestTailToleranceIgnoresACohort(t *testing.T) {
+	finalRate := func(tol float64) float64 {
+		l := New(Config{
+			MinRate:       10,
+			MaxRate:       1000,
+			InitialRate:   500,
+			SLOTarget:     100 * time.Millisecond,
+			TailTolerance: tol,
+		})
+		for i := 0; i < 10; i++ {
+			for j := 0; j < 95; j++ {
+				l.Observe(10 * time.Millisecond)
+			}
+			for j := 0; j < 5; j++ {
+				l.Observe(300 * time.Millisecond)
+			}
+			l.ctrl.step()
+		}
+		return l.Rate()
+	}
+
+	if got := finalRate(0); got >= 500 {
+		t.Fatalf("the p99 guard must fire on a 5%% cohort, rate=%v", got)
+	}
+	if got := finalRate(0.10); got < 500 {
+		t.Fatalf("a 10%% tolerance must ignore a 5%% cohort, rate=%v", got)
+	}
+}
+
+// The guard's input is a ratio of the population, not an order statistic: 5% of
+// the tick over the target reads as 5%, and a real blowout reads as ~100%.
+func TestTailRatioReflectsThePopulation(t *testing.T) {
+	steady := func(over, total int) float64 {
+		l := New(Config{
+			MinRate:       10,
+			MaxRate:       1000,
+			InitialRate:   500,
+			SLOTarget:     100 * time.Millisecond,
+			TailTolerance: 0.10,
+		})
+		for i := 0; i < 10; i++ {
+			for j := 0; j < total-over; j++ {
+				l.Observe(10 * time.Millisecond)
+			}
+			for j := 0; j < over; j++ {
+				l.Observe(300 * time.Millisecond)
+			}
+			l.ctrl.step()
+		}
+		return l.Stats().TailRatio
+	}
+
+	if got := steady(5, 100); got < 0.03 || got > 0.07 {
+		t.Fatalf("a 5%% cohort must read as ~5%%, got %v", got)
+	}
+	if got := steady(100, 100); got < 0.9 {
+		t.Fatalf("a full blowout must read as ~100%%, got %v", got)
+	}
+}
+
+func TestTailToleranceDefaults(t *testing.T) {
+	if got := withDefaults(Config{MinRate: 1, MaxRate: 10}).TailTolerance; got != 0 {
+		t.Fatalf("TailTolerance = %v, want 0 (quantile mode, the historical behaviour)", got)
 	}
 }

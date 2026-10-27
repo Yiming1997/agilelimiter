@@ -35,21 +35,47 @@ downstream RTT ──> histogram (p50/p99) ──> fast/slow EWMA ──> rate f
 
 ## Usage
 
+Two things are yours to decide: how much you are willing to promise, and how slow
+is still acceptable. Everything else is policy, and policy comes from a preset.
+
 ```go
-lim := agilelimiter.New(agilelimiter.Config{
-	MinRate:     20,         // never go below this many req/s
-	MaxRate:     500,        // hard ceiling you promise the downstream
-	InitialRate: 50,         // optional; defaults to MaxRate/8
-	SLOTarget:   200 * time.Millisecond, // optional: p99 tail guard
-})
+cfg := agilelimiter.Config{
+	MaxRate:  500,                     // the ceiling you promise the downstream
+	SLOTarget: 200 * time.Millisecond, // the red line
+	Preset:   agilelimiter.PresetLatencyFirst,
+}
+if err := cfg.Validate(); err != nil { // optional; do it in tests
+	log.Fatal(err)
+}
+
+lim := agilelimiter.New(cfg)
 lim.Start()
 defer lim.Stop()
+
+log.Printf("limiter: %+v", lim.Config()) // what it actually resolved to
 
 // Hot path: wrap the downstream call in Do. It takes a slot, times the call, and
 // feeds the measured round-trip time back to the controller — you never touch
 // Take/Observe, so you cannot feed it the wrong latency.
 err := lim.Do(func() error { return doRequest(ctx) })
 ```
+
+| Preset | Threshold | A step needs | Use it when |
+|---|---|---|---|
+| `PresetNone` (zero) / `PresetBalanced` | 2x baseline | 1 tick | default; protects the knee |
+| `PresetLatencyFirst` | `0.8 x SLOTarget` | 2 ticks | the SLO is a contract |
+| `PresetThroughputFirst` | 3.5x baseline | 2 ticks | downstream degrades gracefully; set `MaxRate` to the knee |
+
+A preset only fills the fields you left at zero, so an explicit setting always
+wins. No preset touches `Tick` or the half-lives: those are the *scale* of the
+control law, and moving them silently re-tunes every gain — they stay available
+for anyone who has read `docs/design.md`.
+
+`Config()` returns a `Resolved` snapshot (defaults applied, presets expanded, an
+SLO anchor that could not be honoured reported rather than hidden). `Validate()`
+reports the configs `New` would otherwise repair in silence — `MinRate` above
+`MaxRate`, a `Deadband` of 1 that makes every latency "healthy", `AnchorSLO`
+without a `SLOTarget`.
 
 When the call returns a value, use the generic form:
 

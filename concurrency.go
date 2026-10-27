@@ -16,6 +16,9 @@ var ErrOverloaded = errors.New("agilelimiter: concurrency limit reached")
 // rather than a rate. The control-law knobs are identical and share the same
 // defaults.
 type ConcurrencyConfig struct {
+	// Preset fills the policy fields you leave at zero (see Config.Preset).
+	Preset Preset
+
 	// MinLimit and MaxLimit bound the dynamic concurrency limit, in requests.
 	// MaxLimit is the *hard ceiling* you are willing to promise the service.
 	// MaxLimit is required: there is no sensible default for it.
@@ -111,15 +114,12 @@ type ConcurrencyLimiter struct {
 	wg        sync.WaitGroup
 }
 
-// NewConcurrency builds a ConcurrencyLimiter. It does not start the control loop;
-// call Start (or drive ctrl.step yourself, as tests do).
-//
-// Internally it reuses the outbound controller verbatim: that controller only
-// multiplies a scalar by a factor and clamps it, so it is agnostic to whether the
-// scalar is a rate or a concurrency limit. We map the limit bounds onto its
-// bound fields and point its setter at the semaphore.
-func NewConcurrency(cc ConcurrencyConfig) *ConcurrencyLimiter {
-	cfg := withDefaults(Config{
+// toConfig maps the concurrency bounds onto the rate config the shared
+// controller works in, so that defaults, presets, Config() and Validate() are
+// one implementation rather than two that can drift.
+func (cc ConcurrencyConfig) toConfig() Config {
+	return Config{
+		Preset:           cc.Preset,
 		MinRate:          cc.MinLimit,
 		MaxRate:          cc.MaxLimit,
 		InitialRate:      cc.InitialLimit,
@@ -141,7 +141,23 @@ func NewConcurrency(cc ConcurrencyConfig) *ConcurrencyLimiter {
 		Deadband:         cc.Deadband,
 		Classify:         cc.Classify,
 		Clock:            cc.Clock,
-	})
+	}
+}
+
+// Validate reports what NewConcurrency would otherwise repair silently. It is
+// Config.Validate applied to the equivalent rate config, so the rules — and the
+// wording — are identical; read MaxLimit as MaxRate.
+func (cc ConcurrencyConfig) Validate() error { return cc.toConfig().Validate() }
+
+// NewConcurrency builds a ConcurrencyLimiter. It does not start the control loop;
+// call Start (or drive ctrl.step yourself, as tests do).
+//
+// Internally it reuses the outbound controller verbatim: that controller only
+// multiplies a scalar by a factor and clamps it, so it is agnostic to whether the
+// scalar is a rate or a concurrency limit. We map the limit bounds onto its
+// bound fields and point its setter at the semaphore.
+func NewConcurrency(cc ConcurrencyConfig) *ConcurrencyLimiter {
+	cfg := withDefaults(cc.toConfig())
 
 	sem := newSemaphore(cfg.InitialRate)
 	h := &histogram{}

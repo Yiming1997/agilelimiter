@@ -161,8 +161,10 @@ func TestRecoverTicksNeedAgreement(t *testing.T) {
 // relative law rather than produce a zero-width window.
 func TestSLOAnchorWithoutSLOFallsBack(t *testing.T) {
 	cfg := withDefaults(Config{MinRate: 10, MaxRate: 500, Anchor: AnchorSLO})
-	if cfg.Anchor != AnchorBaseline {
-		t.Fatalf("Anchor = %v, want AnchorBaseline", cfg.Anchor)
+	// The request is kept, so Config() can report the fallback instead of hiding
+	// it; what changes is the law that actually runs.
+	if cfg.Anchor != AnchorSLO {
+		t.Fatalf("Anchor = %v, want the request preserved for reporting", cfg.Anchor)
 	}
 	if cfg.BackoffTicks != 1 || cfg.RecoverTicks != 1 {
 		t.Fatalf("ticks = %d/%d, want 1/1 for the baseline anchor", cfg.BackoffTicks, cfg.RecoverTicks)

@@ -3,6 +3,7 @@ package agilelimiter
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"time"
 )
@@ -11,6 +12,15 @@ import (
 type Anchor int
 
 const (
+	// AnchorUnset is the zero value: let Preset decide, and fall back to
+	// AnchorBaseline when there is no preset.
+	//
+	// It exists because AnchorBaseline has to be a real, choosable value — so the
+	// zero value cannot also mean "baseline" without making "the caller did not
+	// say" indistinguishable from "the caller asked for the baseline", and then
+	// a preset could never switch an unsuspecting config to the SLO anchor.
+	AnchorUnset Anchor = iota
+
 	// AnchorBaseline is the relative controller: back off when recent latency
 	// rises above (1+TargetInflation) x the *fastest latency this downstream has
 	// been seen to produce*. It protects the knee of the latency curve and needs
@@ -19,7 +29,7 @@ const (
 	// default law backs off to MinRate even though 50ms may be a quarter of the
 	// SLO, and it then stays there for minutes (MinRate -> MaxRate at UpStep per
 	// tick). See docs/design.md §9.
-	AnchorBaseline Anchor = iota
+	AnchorBaseline
 
 	// AnchorSLO is the absolute controller: the backoff threshold is
 	// sloWindowFraction x SLOTarget and nothing else, so a latency rise that
@@ -38,6 +48,16 @@ const (
 
 // Config configures a Limiter. Zero fields take sensible defaults (see withDefaults).
 type Config struct {
+	// Preset fills the *policy* fields you leave at zero: the anchor, the tick
+	// hysteresis, the tolerated multiple, the fast-recovery threshold. Supply
+	// MaxRate — and, for PresetLatencyFirst, SLOTarget — and nothing else to get
+	// a tuned limiter.
+	//
+	// Zero (PresetNone) fills nothing, so a config without a preset behaves
+	// exactly as it did before presets existed. Any field you set explicitly
+	// wins over the preset; see applyPreset for the exact table.
+	Preset Preset
+
 	// MinRate and MaxRate bound the dynamic rate, in requests per second.
 	// MaxRate is the *hard ceiling* you are willing to promise.
 	MinRate int
@@ -188,7 +208,96 @@ const (
 	Aborted
 )
 
+// Preset bundles the knobs that are *policy* rather than fact, so a caller only
+// has to supply the two things only they can know: how much they are willing to
+// promise (MaxRate) and how slow is still acceptable (SLOTarget).
+//
+// A preset fills only the fields the caller left at their zero value, so any
+// explicit setting still wins. PresetNone (the zero value) fills nothing, which
+// is why adding this field changed no existing behaviour.
+type Preset int
+
+const (
+	// PresetNone is the zero value: fill nothing, use the library defaults.
+	PresetNone Preset = iota
+
+	// PresetBalanced is the default law spelled out: the relative anchor at 2x
+	// baseline, single-tick decisions, no fast recovery, every gain at its
+	// default. It is equivalent to PresetNone by construction; it exists so a
+	// config can say what it means, and so a service can pin its behaviour
+	// against a future change of defaults.
+	PresetBalanced
+
+	// PresetLatencyFirst trades utilization for the SLO: the threshold becomes
+	// the SLO itself (0.8 x SLOTarget) instead of a multiple of the baseline, and
+	// a step needs two consecutive ticks. Requires SLOTarget. Use it when the
+	// SLO is a contract and the downstream degrades gracefully until it — see
+	// AnchorSLO for the trade-off.
+	PresetLatencyFirst
+
+	// PresetThroughputFirst tolerates more queueing (3.5x baseline) and also
+	// needs two consecutive ticks, which is the shape that came out of the
+	// scenario matrix best on a downstream with a knee. Set MaxRate to the knee:
+	// this preset will happily run at the ceiling.
+	PresetThroughputFirst
+)
+
+func (p Preset) String() string {
+	switch p {
+	case PresetBalanced:
+		return "balanced"
+	case PresetLatencyFirst:
+		return "latency-first"
+	case PresetThroughputFirst:
+		return "throughput-first"
+	default:
+		return "none"
+	}
+}
+
+// applyPreset fills the policy fields the caller left at zero.
+//
+// The table is deliberately small: a preset that differs in more than a handful
+// of fields is not a preset, it is a different controller, and nobody can reason
+// about the difference. Note that no preset touches Tick or the half-lives —
+// those are the scale of the control law, not a policy choice, and moving them
+// silently re-tunes every gain.
+func applyPreset(c Config) Config {
+	switch c.Preset {
+	case PresetLatencyFirst:
+		if c.Anchor == AnchorUnset {
+			c.Anchor = AnchorSLO
+		}
+		if c.BackoffTicks <= 0 {
+			c.BackoffTicks = 2
+		}
+		if c.RecoverTicks <= 0 {
+			c.RecoverTicks = 2
+		}
+	case PresetThroughputFirst:
+		if c.Anchor == AnchorUnset {
+			c.Anchor = AnchorBaseline
+		}
+		if c.TargetInflation <= 0 {
+			c.TargetInflation = 2.5
+		}
+		if c.BackoffTicks <= 0 {
+			c.BackoffTicks = 2
+		}
+		if c.RecoverTicks <= 0 {
+			c.RecoverTicks = 1
+		}
+	case PresetBalanced, PresetNone:
+		// Nothing to do: the defaults below *are* the balanced law.
+	}
+	return c
+}
+
 func withDefaults(c Config) Config {
+	c = applyPreset(c)
+	if c.Anchor == AnchorUnset {
+		c.Anchor = AnchorBaseline
+	}
 	if c.Per <= 0 {
 		c.Per = time.Second
 	}
@@ -246,20 +355,20 @@ func withDefaults(c Config) Config {
 	if c.Deadband <= 0 {
 		c.Deadband = 0.05
 	}
-	if c.Anchor == AnchorSLO && c.SLOTarget <= 0 {
-		// The absolute window is derived from the SLO, so without one there is
-		// nothing to anchor to. Falling back beats a window of zero.
-		c.Anchor = AnchorBaseline
-	}
+	// A caller (or a preset) can ask for the SLO anchor without supplying an SLO.
+	// The config keeps the request — Config() then *reports* the fallback instead
+	// of hiding it, and Validate() rejects it — but the tick defaults follow the
+	// law that will actually run, which is the relative one.
+	sloAnchor := c.Anchor == AnchorSLO && c.SLOTarget > 0
 	if c.BackoffTicks <= 0 {
 		c.BackoffTicks = 1
-		if c.Anchor == AnchorSLO {
+		if sloAnchor {
 			c.BackoffTicks = 2
 		}
 	}
 	if c.RecoverTicks <= 0 {
 		c.RecoverTicks = 1
-		if c.Anchor == AnchorSLO {
+		if sloAnchor {
 			c.RecoverTicks = 2
 		}
 	}
@@ -468,4 +577,176 @@ func (l *Limiter) Start() {
 func (l *Limiter) Stop() {
 	l.stopOnce.Do(func() { close(l.stop) })
 	l.wg.Wait()
+}
+
+// Resolved is a printable snapshot of the configuration a limiter is actually
+// running with: presets applied, defaults filled in, and an SLO anchor that
+// could not be honoured reported instead of hidden.
+//
+// Config itself cannot be logged usefully — it carries two functions — and
+// "what did my config turn into" is the first question of every debugging
+// session. An adaptive limiter you cannot see into is one you cannot debug.
+type Resolved struct {
+	// Kind is "rate" for a Limiter and "concurrency" for a ConcurrencyLimiter.
+	// For the latter the three *Rate fields below hold the concurrency bounds.
+	Kind   string
+	Preset string
+
+	MaxRate     int
+	MinRate     int
+	InitialRate int
+	Per         time.Duration
+
+	// Anchor is "baseline", "slo", or "baseline (AnchorSLO requested without
+	// SLOTarget)". The last form is a config that asked for the absolute anchor
+	// and is running the relative one.
+	Anchor string
+	// Window describes the tolerated band. Only its static part can be known
+	// before the first sample — the baseline it is measured against does not
+	// exist yet — so it is a formula, not a number.
+	Window    string
+	SLOTarget time.Duration
+
+	Tick             time.Duration
+	FastHalfLife     time.Duration
+	SlowHalfLife     time.Duration
+	SlowDownHalfLife time.Duration
+	MaxBaselineRise  float64
+
+	TargetInflation float64
+	Gain            float64
+	UpStep          float64
+	DownStep        float64
+	SlowStartGain   float64
+	Deadband        float64
+
+	BackoffTicks int
+	RecoverTicks int
+	RecoverRamp  float64
+}
+
+// Config returns the configuration this limiter is actually running with.
+func (l *Limiter) Config() Resolved { return resolve(l.cfg, "rate") }
+
+// Config returns the configuration this limiter is actually running with. The
+// MaxRate/MinRate/InitialRate fields hold the concurrency bounds; Kind says so.
+func (l *ConcurrencyLimiter) Config() Resolved { return resolve(l.cfg, "concurrency") }
+
+func resolve(cfg Config, kind string) Resolved {
+	r := Resolved{
+		Kind:             kind,
+		Preset:           cfg.Preset.String(),
+		MaxRate:          cfg.MaxRate,
+		MinRate:          cfg.MinRate,
+		InitialRate:      cfg.InitialRate,
+		Per:              cfg.Per,
+		SLOTarget:        cfg.SLOTarget,
+		Tick:             cfg.Tick,
+		FastHalfLife:     cfg.FastHalfLife,
+		SlowHalfLife:     cfg.SlowHalfLife,
+		SlowDownHalfLife: cfg.SlowDownHalfLife,
+		MaxBaselineRise:  cfg.MaxBaselineRise,
+		TargetInflation:  cfg.TargetInflation,
+		Gain:             cfg.Gain,
+		UpStep:           cfg.UpStep,
+		DownStep:         cfg.DownStep,
+		SlowStartGain:    cfg.SlowStartGain,
+		Deadband:         cfg.Deadband,
+		BackoffTicks:     cfg.BackoffTicks,
+		RecoverTicks:     cfg.RecoverTicks,
+		RecoverRamp:      cfg.RecoverRamp,
+	}
+
+	sloWindow := time.Duration(float64(cfg.SLOTarget) * sloWindowFraction)
+	ratio := fmt.Sprintf("%.2fx baseline", 1+cfg.TargetInflation)
+	switch {
+	case cfg.Anchor == AnchorSLO && cfg.SLOTarget > 0:
+		r.Anchor = "slo"
+		r.Window = fmt.Sprintf("%s (%.1f x SLOTarget)", sloWindow, sloWindowFraction)
+	case cfg.Anchor == AnchorSLO:
+		r.Anchor = "baseline (AnchorSLO requested without SLOTarget)"
+		r.Window = ratio
+	case cfg.SLOTarget > 0:
+		r.Anchor = "baseline"
+		r.Window = fmt.Sprintf("%s, capped at %s", ratio, sloWindow)
+	default:
+		r.Anchor = "baseline"
+		r.Window = ratio
+	}
+	return r
+}
+
+// Validate reports the configurations that New would otherwise repair silently,
+// and the ones it cannot make sense of at all.
+//
+// It validates the config you *wrote*, not the resolved one: every zero field
+// means "use the default", which is always valid. Call it before New if you want
+// a bad config to fail loudly — New keeps its signature, because a library that
+// starts returning errors on upgrade breaks every caller at once.
+//
+// The repairs it catches are worth knowing by name, because each one used to
+// happen in silence: MinRate above MaxRate was clamped, Deadband of 1 turned
+// every latency into "healthy", and an AnchorSLO without SLOTarget quietly ran
+// the relative law.
+func (c Config) Validate() error {
+	var errs []error
+	add := func(format string, args ...any) {
+		errs = append(errs, fmt.Errorf(format, args...))
+	}
+
+	if c.MaxRate <= 0 {
+		add("MaxRate is required: it is the rate you promise the downstream")
+	} else if c.MinRate > c.MaxRate {
+		add("MinRate (%d) exceeds MaxRate (%d): the floor would be the ceiling", c.MinRate, c.MaxRate)
+	}
+	if c.InitialRate < 0 || (c.MaxRate > 0 && c.InitialRate > c.MaxRate) {
+		add("InitialRate (%d) must be within [0, MaxRate=%d]", c.InitialRate, c.MaxRate)
+	}
+	if c.Anchor == AnchorSLO && c.SLOTarget <= 0 {
+		add("Anchor=AnchorSLO needs SLOTarget: the absolute anchor has no other threshold to use")
+	}
+	if c.SLOTarget > 0 && c.SLOTarget < 10*time.Millisecond {
+		add("SLOTarget %s is below 10ms, which is usually a unit mistake", c.SLOTarget)
+	}
+	if c.Tick < 0 || c.Tick > 10*time.Second {
+		add("Tick %s must be within (0s, 10s]", c.Tick)
+	}
+	if c.TargetInflation < 0 {
+		add("TargetInflation %.3f must not be negative", c.TargetInflation)
+	}
+	if c.Gain < 0 {
+		add("Gain %.3f must not be negative", c.Gain)
+	}
+	if c.UpStep < 0 || c.DownStep < 0 {
+		add("UpStep and DownStep must not be negative")
+	}
+	if c.DownStep > 1 {
+		add("DownStep %.3f would take the rate to zero in one tick", c.DownStep)
+	}
+	if c.SlowStartGain != 0 && c.SlowStartGain < 1 {
+		add("SlowStartGain %.3f is below 1: it would decay the rate while healthy", c.SlowStartGain)
+	}
+	if c.Deadband < 0 || c.Deadband >= 1 {
+		add("Deadband %.3f must be within [0, 1): 1 makes every latency count as healthy", c.Deadband)
+	}
+	if c.BackoffTicks < 0 || c.RecoverTicks < 0 {
+		add("BackoffTicks and RecoverTicks must not be negative")
+	}
+	if c.RecoverRamp < 0 || c.RecoverRamp > 1 {
+		add("RecoverRamp %.3f must be within [0, 1]", c.RecoverRamp)
+	}
+	if c.MaxBaselineRise < 0 {
+		add("MaxBaselineRise %.4f must not be negative", c.MaxBaselineRise)
+	}
+	// A half-life shorter than a few ticks degenerates the filter into a
+	// pass-through (alpha -> 1) and the setting stops meaning anything.
+	if c.Tick > 0 {
+		if c.FastHalfLife > 0 && c.FastHalfLife < 3*c.Tick {
+			add("FastHalfLife %s is under 3x Tick (%s): the filter stops smoothing", c.FastHalfLife, c.Tick)
+		}
+		if c.SlowHalfLife > 0 && c.SlowHalfLife < 3*c.Tick {
+			add("SlowHalfLife %s is under 3x Tick (%s): the baseline stops being a baseline", c.SlowHalfLife, c.Tick)
+		}
+	}
+	return errors.Join(errs...)
 }

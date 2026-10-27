@@ -590,6 +590,54 @@ These are properties of the control law and of the deployment, not of the signal
 - **Many instances.** Each process converges on its own; there is no shared view
   of a shared dependency.
 
+## Signal hygiene: what must not enter the sample
+
+Everything above is about which *policy* a duration is subject to. This section is
+about whether the duration measures the downstream at all. The controller has one
+input and no way to tell a meaningful sample from a misleading one, so
+`compare/pollution_test.go` measures the cost of getting it wrong. Every arm runs
+against a **flat** downstream — latency independent of rate — which means no rate
+change in it can be congestion by construction. The control arm is the same
+limiter with the pollution removed:
+
+| sample stream | control | polluted | what happened |
+|---|---:|---:|---|
+| 80% of requests answer in 1ms (cache hits) | 135/s | 136/s | no damage: the miss path could not saturate |
+| 5% of requests always cost 300ms | 136/s | **54/s** | the tail guard read a fixed population as congestion |
+| an internal retry doubles the sample | 135/s | **24/s, 0% in SLO** | the absolute check compared twice the real latency |
+| 20ms of caller work, sample stays under `SLOTarget` | 136/s | 136/s | no damage: window and signal shift together |
+| 50ms of caller work, sample crosses `SLOTarget` | 135/s | **24/s, 0% in SLO** | same pollution, now it trips the guard |
+
+**The relative window is self-correcting; the guard is not.** In every row that
+collapsed, the median law said *healthy*: a constant offset moves `fast` and
+`slow` together, and a ratio does not care about it. The absolute comparison
+does, and it turns a polluted sample into a 30%-per-tick backoff straight to
+`MinRate`.
+
+**`SLOTarget` is not the SLO you promise.** A SLO is a fraction over a long
+window ("99% of requests under 200ms"); the guard compares *one tick's* p99
+against this number. A service that exactly meets its own SLO crosses that line
+on roughly half its ticks, and half the ticks is enough to walk the rate to the
+floor, because `0.70 x 1.05 < 1`. Set it at 1.5-2x the p99 you normally see,
+not at the number you write in the contract.
+
+The shape of the fix is always the same — decide what the number means *before*
+it reaches `Observe`:
+
+| if a sample can be… | then |
+|---|---|
+| a cache hit, a health check, a CORS preflight | classify it `Aborted`; it says nothing about remaining capacity |
+| a different endpoint with its own latency profile | give it its own limiter; do not average two populations into one p50 |
+| a retried attempt | use `Take`/`Observe` per attempt — `Do` measures exactly one attempt by definition |
+| caller-side work (marshal, lock waits, GC) | measure only the call, and remember that the overhead eats your SLO headroom |
+| an attempt truncated by *your* deadline | make sure the deadline is longer than `SLOTarget`: a shorter one caps every sample, and the limiter goes blind above it |
+
+That last row is the one that fails quietly. `DeadlineExceeded` is deliberately
+recorded as a real round trip (a downstream that times out *is* struggling), but
+if the deadline is shorter than the downstream's healthy latency, every sample
+becomes the deadline: a flat line at 30ms that looks perfectly healthy while every
+request fails. The limiter will happily raise the rate into it.
+
 ## Pitfalls (read before tuning)
 
 - **Baseline pollution.** If the slow EWMA is allowed to rise freely, a long

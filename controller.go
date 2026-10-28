@@ -52,9 +52,12 @@ type controller struct {
 	above, below int
 
 	// over is the smoothed fraction of samples above the tail target, and
-	// overAlpha is its EWMA factor. It only exists in ratio mode.
+	// overAlpha is its EWMA factor. They only exist in ratio mode.
 	over      float64
 	overAlpha float64
+	// tailThreshold is the effective firing threshold: the caller's tolerance plus
+	// tailSigma standard errors, recomputed each tick from the sample count.
+	tailThreshold float64
 
 	// what the last completed tick saw, for Stats
 	lastP50, lastP99 time.Duration
@@ -191,13 +194,20 @@ func (c *controller) step() {
 	if tail := c.tailTarget(); tail > 0 {
 		switch {
 		case c.cfg.TailTolerance > 0:
-			var ratio float64
-			if n > 0 {
-				ratio = float64(above) / float64(n)
-			}
-			c.over += c.overAlpha * (ratio - c.over)
-			if c.over > c.cfg.TailTolerance {
-				excess := (c.over - c.cfg.TailTolerance) / c.cfg.TailTolerance
+			c.over += c.overAlpha * (float64(above)/float64(n) - c.over)
+
+			// The tolerance is the caller's policy; the margin is the controller's
+			// evidence. A per-tick exceedance ratio is a binomial proportion, so its
+			// standard error is sqrt(p(1-p)/n) — which is why the same tolerance
+			// needs a wider margin on a low-traffic service than on a busy one. The
+			// EWMA averages about 1/varianceFactor ticks, so sigma is scaled by
+			// sqrt(alpha/(2-alpha)) to describe the smoothed estimate.
+			tol := c.cfg.TailTolerance
+			sigma := math.Sqrt(tol*(1-tol)/float64(n)) * math.Sqrt(c.overAlpha/(2-c.overAlpha))
+			c.tailThreshold = tol + tailSigma*sigma
+
+			if c.over > c.tailThreshold {
+				excess := (c.over - tol) / tol
 				if floor := 1 - math.Min(c.cfg.DownStep, c.cfg.Gain*excess); factor > floor {
 					factor = floor
 				}
@@ -258,6 +268,17 @@ func (c *controller) tailTarget() time.Duration {
 	}
 	return time.Duration(float64(c.cfg.SLOTarget) * c.cfg.TailFactor)
 }
+
+// tailSigma is how many standard errors above the tolerance the observed ratio
+// has to be before the guard fires.
+//
+// Three is the conventional "this is not noise" bar, and it is deliberately a
+// statistical convention rather than a tuned number: the caller supplies the
+// policy (what share of traffic may be slow) and the controller supplies the
+// evidence bar, derived from the sample count it actually has. That is what makes
+// "set the tolerance to 2x the cohort" unnecessary — on a busy service the margin
+// is small, and on a quiet one it is large because the measurement is weaker.
+const tailSigma = 3.0
 
 // snapshotTail is the threshold the histogram should count observations above,
 // or zero to skip the count. Only ratio mode needs it: quantile mode reads p99.
@@ -327,6 +348,7 @@ func (c *controller) stats() Stats {
 		P50:       c.lastP50,
 		P99:       c.lastP99,
 		TailRatio: c.over,
+		TailThreshold: c.tailThreshold,
 		ColdStart: c.coldStart,
 	}
 }

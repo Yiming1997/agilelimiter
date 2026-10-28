@@ -589,6 +589,14 @@ type Stats struct {
 	// Export it: a non-zero TailRatio with a rate that is not moving tells you the
 	// guard is at its threshold and the population, not the load, is deciding.
 	TailRatio float64
+	// TailThreshold is what TailRatio is compared against: TailTolerance plus
+	// tailSigma standard errors, recomputed every tick from the sample count. It
+	// is zero in quantile mode.
+	//
+	// Export it because it turns "why did the guard not fire?" into arithmetic: a
+	// low-traffic service has a small n, therefore a wide margin, therefore a
+	// threshold far above its tolerance.
+	TailThreshold float64
 
 	// ColdStart is true until the controller has had to back off once (or has
 	// saturated at MaxRate). While it is true the controller doubles each healthy
@@ -738,8 +746,8 @@ func resolve(cfg Config, kind string) Resolved {
 	} else {
 		target := time.Duration(float64(cfg.SLOTarget) * cfg.TailFactor)
 		if cfg.TailTolerance > 0 {
-			r.Tail = fmt.Sprintf("%.0f%% of requests above %s (%.1fx SLOTarget)",
-				cfg.TailTolerance*100, target, cfg.TailFactor)
+			r.Tail = fmt.Sprintf("%.0f%%+%.0fσ of requests above %s (%.1fx SLOTarget)",
+				cfg.TailTolerance*100, tailSigma, target, cfg.TailFactor)
 		} else {
 			r.Tail = fmt.Sprintf("p99 > %s (%.1fx SLOTarget)", target, cfg.TailFactor)
 		}

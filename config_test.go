@@ -201,7 +201,7 @@ func TestResolvedDescribesTheGuard(t *testing.T) {
 		TailFactor:    2,
 		TailTolerance: 0.1,
 	}).Config()
-	if ratio.Tail != "10% of requests above 200ms (2.0x SLOTarget)" {
+	if ratio.Tail != "10%+3σ of requests above 200ms (2.0x SLOTarget)" {
 		t.Fatalf("Tail = %q", ratio.Tail)
 	}
 
@@ -237,6 +237,11 @@ func TestTailToleranceIgnoresACohort(t *testing.T) {
 
 	if got := finalRate(0); got >= 500 {
 		t.Fatalf("the p99 guard must fire on a 5%% cohort, rate=%v", got)
+	}
+	// The tolerance can be set *at* the cohort's share now: the controller adds
+	// its own statistical margin, so nobody has to bake a 2x fudge factor in.
+	if got := finalRate(0.05); got < 500 {
+		t.Fatalf("a 5%% tolerance must ignore a 5%% cohort once the margin is applied, rate=%v", got)
 	}
 	if got := finalRate(0.10); got < 500 {
 		t.Fatalf("a 10%% tolerance must ignore a 5%% cohort, rate=%v", got)

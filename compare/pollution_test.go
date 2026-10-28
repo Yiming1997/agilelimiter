@@ -15,6 +15,8 @@ package main
 
 import (
 	"fmt"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -155,6 +157,105 @@ func TestTailTolerance(t *testing.T) {
 		}
 		report("=== "+sc.label+" ===", rows)
 	}
+}
+
+// marginCell is one point of the margin sweep.
+type marginCell struct {
+	rate      int
+	cohortPct int
+	samples   float64 // mean samples per tick, i.e. the measurement's power
+	minRate   float64 // lowest target rate after the first second
+	meanOver  float64
+	meanThresh float64
+}
+
+func (c marginCell) held() bool { return c.minRate >= 0.99*float64(c.rate) }
+
+// runCell drives one limiter at a fixed ceiling with a fixed cohort and reports
+// whether the guard left it alone.
+func runCell(rate, cohortPct int, tol float64, dur time.Duration) marginCell {
+	shape := withSlowCohort(flatLatency(24*time.Millisecond), cohortPct, 300*time.Millisecond)
+	lim := agilelimiter.New(agilelimiter.Config{
+		MinRate:       pollMin,
+		MaxRate:       rate,
+		InitialRate:   rate,
+		SLOTarget:     pollSLO,
+		TailTolerance: tol,
+		FastHalfLife:  750 * time.Millisecond,
+		SlowHalfLife:  45 * time.Second,
+		Tick:          250 * time.Millisecond,
+	})
+	lim.Start()
+	defer lim.Stop()
+
+	begin := time.Now()
+	deadline := begin.Add(dur)
+	var seq atomic.Uint64
+	var wg sync.WaitGroup
+	for i := 0; i < 120; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for time.Now().Before(deadline) {
+				lim.Take()
+				start := time.Now()
+				t := start.Sub(begin)
+				time.Sleep(shape(lim.Rate()/pollCapacity, t, seq.Add(1)))
+				lim.Observe(time.Since(start))
+			}
+		}()
+	}
+
+	out := marginCell{rate: rate, cohortPct: cohortPct, minRate: float64(rate)}
+	var nSamples, nOver, nThresh, ticks float64
+	for time.Now().Before(deadline) {
+		time.Sleep(200 * time.Millisecond)
+		st := lim.Stats()
+		if time.Since(begin) < time.Second {
+			continue // ignore the cold start
+		}
+		ticks++
+		nSamples += float64(st.Samples)
+		nOver += st.TailRatio
+		nThresh += st.TailThreshold
+		if st.Rate < out.minRate {
+			out.minRate = st.Rate
+		}
+	}
+	wg.Wait()
+	if ticks > 0 {
+		out.samples, out.meanOver, out.meanThresh = nSamples/ticks, nOver/ticks, nThresh/ticks
+	}
+	return out
+}
+
+// TestTailMargin is the sweep the margin exists for: the same policy tolerance,
+// three traffic volumes and three cohort shares. The question is not "what value
+// works" but "does the controller derive its own bar, and where does it run out
+// of evidence".
+func TestTailMargin(t *testing.T) {
+	const tol = 0.05
+	fmt.Println("tail margin sweep: policy tolerance 5%, margin derived from the sample count")
+	fmt.Printf("downstream: FLAT 24ms, with `cohort` percent of requests always at 300ms\n")
+	fmt.Printf("tol = %.0f%% for every cell; the window is 6s at a fixed ceiling\n", tol*100)
+	fmt.Println()
+	fmt.Printf("  %6s %8s %8s %10s %9s %9s  %s\n",
+		"rate", "cohort", "samples/", "min rate", "meanOver", "threshold", "verdict")
+
+	for _, rate := range []int{30, 120, 300} {
+		for _, cohort := range []int{2, 5, 8} {
+			c := runCell(rate, cohort, tol, 6*time.Second)
+			verdict := "held"
+			if !c.held() {
+				verdict = "THROTTLED"
+			}
+			fmt.Printf("  %6d %7d%% %8.0f %10.0f %9.3f %9.3f  %s\n",
+				c.rate, c.cohortPct, c.samples, c.minRate, c.meanOver, c.meanThresh, verdict)
+		}
+	}
+	fmt.Println()
+	fmt.Println("held = the guard left the rate alone; a cohort at or below the tolerance")
+	fmt.Println("must never move it, and the margin should be wider where samples are few.")
 }
 
 func TestPollution(t *testing.T) {

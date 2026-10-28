@@ -627,23 +627,32 @@ request types rather than of queueing: `SLOTarget` stays the number in the
 contract, the window cap and the `AnchorSLO` target stay where they are, and only
 the guard gets room.
 
-`TailTolerance` (default 0 — off) changes the guard's *statistic* instead. With a
-tolerance the guard fires when the smoothed **fraction of the tick above the
-target** exceeds it, rather than when the p99 does. That is the difference between
-"5% of my traffic is a report endpoint" and "everything got slower":
+`TailTolerance` (default 0 — off) changes the guard's *statistic* instead: it fires
+when the smoothed **fraction of the tick above the target** exceeds the tolerance
+by more than three standard errors. The caller supplies the policy (how much slow
+traffic is acceptable) and the controller supplies the evidence bar, derived from
+the sample count it actually has — so a busy service gets a tight margin and a
+quiet one gets a wide one, because a quiet service measures less. That is the
+difference between "5% of my traffic is a report endpoint" and "everything got
+slower":
 
 | 5% of requests always cost 300ms | achieved/s | %<=SLO | rate |
 |---|---:|---:|---:|
 | `TailTolerance` 0 (p99 test) | 54 | 94% | **21** |
-| `TailTolerance` 0.05 | 44 | 95% | 15 |
-| `TailTolerance` 0.10 | 136 | 95% | **300** |
+| `TailTolerance` 0.05 | 136 | 95% | **300** |
+| `TailTolerance` 0.10 | 135 | 95% | 300 |
 
-and when *every* request costs 300ms the same 0.10 still takes the rate to
-`MinRate` (25 req/s, 0% inside the SLO), so the protection is intact.
+A tolerance set *at* the cohort's share holds, because the margin absorbs the
+sampling noise — there is no headroom factor to tune. And when *every* request
+costs 300ms all three settings still take the rate to `MinRate` (25 req/s, 0%
+inside the SLO), so the protection is intact.
 
-Note the middle row: a tolerance set *at* the cohort's share does not hold, because
-the per-tick ratio is a sampled statistic and fluctuates around it. Leave headroom
-— roughly twice the share you expect.
+`Stats().TailThreshold` is the derived bar (`tol + 3σ`), wider exactly where the
+sample count is small. The sweep in `compare` (`TestTailMargin`) measures 0.149 at
+~8 samples per tick, 0.105 at ~24 and 0.098 at ~33, with no false positive at any
+of them. The same sweep shows where the evidence runs out: a cohort three points
+above the tolerance is not resolvable at ~24 samples per tick, and the guard stays
+quiet rather than guessing.
 
 The shape of the fix is always the same — decide what the number means *before*
 it reaches `Observe`:

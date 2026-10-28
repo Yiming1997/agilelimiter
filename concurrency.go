@@ -46,9 +46,6 @@ type ConcurrencyConfig struct {
 	// BackoffTicks and RecoverTicks are the time hysteresis (see Config).
 	BackoffTicks int
 	RecoverTicks int
-	// RecoverRamp is how far below the tolerated latency the observed latency has
-	// to be before a multiplicative probe is allowed again (see Config).
-	RecoverRamp float64
 
 	// EWMA half-lives for the control signal.
 	FastHalfLife     time.Duration // recent latency
@@ -134,7 +131,6 @@ func (cc ConcurrencyConfig) toConfig() Config {
 		Anchor:           cc.Anchor,
 		BackoffTicks:     cc.BackoffTicks,
 		RecoverTicks:     cc.RecoverTicks,
-		RecoverRamp:      cc.RecoverRamp,
 		FastHalfLife:     cc.FastHalfLife,
 		SlowHalfLife:     cc.SlowHalfLife,
 		SlowDownHalfLife: cc.SlowDownHalfLife,

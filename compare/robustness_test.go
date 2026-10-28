@@ -40,6 +40,11 @@ type probeCfg struct {
 	slo      time.Duration
 	capacity float64 // 0 = flat downstream (no queueing); >0 = mm1-shaped
 
+	// tailFactor moves the guard's threshold away from the SLO. Setting it very
+	// high disables the guard without disabling the median law, which is how the
+	// ablation below tells the two apart.
+	tailFactor float64
+
 	workers int
 }
 
@@ -109,6 +114,7 @@ func driveProbe(cfg probeCfg, shape shapeAt, dur time.Duration) probeOut {
 		InitialRate:   cfg.rate,
 		SLOTarget:     cfg.slo,
 		TailTolerance: cfg.tol,
+		TailFactor:    cfg.tailFactor,
 		Anchor:        cfg.anchor,
 		Preset:        cfg.preset,
 		FastHalfLife:  750 * time.Millisecond,
@@ -211,7 +217,6 @@ const (
 	holdOK verdict = iota
 	throttleOK
 	recoverOK
-	settleOK
 )
 
 func (v verdict) String() string {
@@ -220,8 +225,6 @@ func (v verdict) String() string {
 		return "hold"
 	case throttleOK:
 		return "throttle"
-	case settleOK:
-		return "settle"
 	default:
 		return "recover"
 	}
@@ -242,16 +245,6 @@ func judge(v verdict, cfg probeCfg, out probeOut) (bool, string) {
 			return false, "ignored"
 		}
 		return true, "throttled"
-	case settleOK:
-		// Contamination that crosses the policy line part-way through: it must not
-		// kill the rate early, and it must have moved it by the end.
-		if out.minAfter(time.Second) < 0.50*ceiling {
-			return false, "died early"
-		}
-		if out.last() > 0.90*ceiling {
-			return false, "ignored"
-		}
-		return true, "settled"
 	default: // recoverOK
 		if out.last() < 0.80*ceiling {
 			return false, "stuck"
@@ -297,7 +290,11 @@ func TestRobustContamination(t *testing.T) {
 			}
 			return 60 * time.Millisecond
 		}, holdOK},
-		{"cohort ramps 0 -> 25% at 300ms", cohortRampAt(24*time.Millisecond, 25, 300*time.Millisecond, 5*time.Second), settleOK},
+		// A cohort that ramps through the policy line: by the end it is far over, so
+		// the rate must have come down. That it does not die *before* the line is
+		// crossed is TestRobustCohortShare's job — a minimum over the whole run
+		// cannot express it, because for a monotonic ramp the minimum is the end.
+		{"cohort ramps 0 -> 25% at 300ms", cohortRampAt(24*time.Millisecond, 25, 300*time.Millisecond, 5*time.Second), throttleOK},
 		{"retry x2: 60ms -> 120ms (uniform)", constShape(120 * time.Millisecond), throttleOK},
 		{"retry x3: 40ms -> 120ms (uniform)", constShape(120 * time.Millisecond), throttleOK},
 		{"local +50ms: 60ms -> 110ms (uniform)", constShape(110 * time.Millisecond), throttleOK},
@@ -475,10 +472,18 @@ func TestRobustTransient(t *testing.T) {
 	fmt.Println()
 
 	for _, tol := range []struct {
-		label string
-		v     float64
-	}{{"default (tol 0)", 0}, {"tol 5%", 0.05}} {
-		cfg := probeCfg{rate: int(ceiling), tol: tol.v, slo: pollSLO}
+		label  string
+		v      float64
+		factor float64
+	}{
+		{"default (tol 0)", 0, 0},
+		{"tol 5%", 0.05, 0},
+		// Ablation: the same ratio guard with a threshold no latency can reach,
+		// i.e. the guard cannot fire and only the median law acts. If this arm
+		// recovers and the one above does not, the guard is what keeps cutting.
+		{"tol 5%, guard off", 0.05, 100},
+	} {
+		cfg := probeCfg{rate: int(ceiling), tol: tol.v, slo: pollSLO, tailFactor: tol.factor}
 		dirty := func(el time.Duration, _ float64, _ uint64) time.Duration {
 			if el >= time.Second && el < 2*time.Second {
 				return 400 * time.Millisecond
@@ -504,8 +509,8 @@ func TestRobustTransient(t *testing.T) {
 			}
 		}
 
-		fmt.Printf("  %-16s  t=1s %5.0f | t=2s %5.0f | t=3s %5.0f | t=4s %5.0f | t=6s %5.0f | back to 90%%: ",
-			tol.label, at(1*time.Second), at(2*time.Second), at(3*time.Second), at(4*time.Second), at(6*time.Second))
+		fmt.Printf("  %-16s  t=1s %5.0f | t=2s %5.0f | t=3s %5.0f | t=4s %5.0f | t=5.5s %5.0f | back to 90%%: ",
+			tol.label, at(1*time.Second), at(2*time.Second), at(3*time.Second), at(4*time.Second), at(5500*time.Millisecond))
 		if back < 0 {
 			fmt.Printf("> %.0fs (< %.0f of %0.f at the end)\n", 4.0, out.last(), ceiling)
 		} else {

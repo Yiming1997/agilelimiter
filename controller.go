@@ -161,7 +161,15 @@ func (c *controller) step() {
 		} else {
 			factor = 1 + c.cfg.UpStep
 		}
-	case c.fast >= high:
+	// A backoff needs *both* the filtered signal and this tick's median above the
+	// window. `fast` is a memory — three seconds by default — so on the way down it
+	// keeps reporting congestion long after the latency is gone: measured on a
+	// downstream that is healthy before and after a one-second stall, the rate fell
+	// 300 -> 72 during the stall and then 72 -> 5 afterwards, because fourteen
+	// consecutive -30% ticks fired while every request was answering in 24ms. A
+	// filtered signal is the right thing to *trust*; it is the wrong thing to keep
+	// *acting on* once the live median has recovered.
+	case c.fast >= high && v >= high:
 		c.above++
 		c.below = 0
 		if c.above < c.cfg.BackoffTicks {
@@ -203,7 +211,12 @@ func (c *controller) step() {
 			sigma := math.Sqrt(tol*(1-tol)/float64(n)) * math.Sqrt(c.overAlpha/(2-c.overAlpha))
 			c.tailThreshold = tol + tailSigma*sigma
 
-			if c.over > c.tailThreshold {
+			if c.over > c.tailThreshold && float64(above) > tol*float64(n) {
+				// Both halves are needed for the same reason the median law needs
+				// them: `over` is a memory, and acting on it alone keeps cutting for
+				// about six ticks after the tail has already recovered — measured,
+				// that cost two thirds of the rate a second after a one-second stall
+				// ended (22 req/s recovered against 68 with the guard muted).
 				excess := (c.over - tol) / tol
 				if floor := 1 - math.Min(c.cfg.DownStep, c.cfg.Gain*excess); factor > floor {
 					factor = floor

@@ -331,15 +331,15 @@ func (c *controller) stats() Stats {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return Stats{
-		Rate:      c.rate,
-		Baseline:  time.Duration(c.slow),
-		Fast:      time.Duration(c.fast),
-		Samples:   c.lastSamples,
-		P50:       c.lastP50,
-		P99:       c.lastP99,
-		TailRatio: c.over,
+		Rate:          c.rate,
+		Baseline:      time.Duration(c.slow),
+		Fast:          time.Duration(c.fast),
+		Samples:       c.lastSamples,
+		P50:           c.lastP50,
+		P99:           c.lastP99,
+		TailRatio:     c.over,
 		TailThreshold: c.tailThreshold,
-		ColdStart: c.coldStart,
+		ColdStart:     c.coldStart,
 	}
 }
 

@@ -24,6 +24,7 @@ import (
 	"math"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"agilelimiter"
@@ -54,6 +55,10 @@ type downstream struct {
 	// slo is the contract a request is scored against. Zero means the package
 	// default, which is what every case in main.go uses.
 	slo time.Duration
+	// shape, when set, replaces base*wait and is called once per request with a
+	// per-request sequence number. It exists so the pollution experiments can run
+	// two populations — a cache hit and a miss — through one limiter.
+	shape func(util float64, t time.Duration, seq uint64) time.Duration
 }
 
 // mm1 is 1/(1-util), clamped so saturation stays finite instead of dividing by
@@ -69,12 +74,16 @@ func mm1(util float64) float64 {
 	return 1 / (1 - util)
 }
 
-func (d downstream) rtt(offered, capacity float64, t time.Duration) time.Duration {
+func (d downstream) rtt(offered, capacity float64, t time.Duration, seq uint64) time.Duration {
+	util := offered / capacity
+	if d.shape != nil {
+		return d.shape(util, t, seq)
+	}
 	wait := d.wait
 	if wait == nil {
 		wait = mm1
 	}
-	return time.Duration(float64(d.base(t)) * wait(offered/capacity))
+	return time.Duration(float64(d.base(t)) * wait(util))
 }
 
 // steadyBase is an idle response time that never changes.
@@ -163,6 +172,7 @@ func runOn(label string, mk func() (limiter, func()), ds downstream, sched func(
 	deadline := begin.Add(dur)
 
 	var wg sync.WaitGroup
+	var seq atomic.Uint64
 	for i := 0; i < pool; i++ {
 		wg.Add(1)
 		go func() {
@@ -171,7 +181,7 @@ func runOn(label string, mk func() (limiter, func()), ds downstream, sched func(
 				lim.take()
 				start := time.Now()
 				t := start.Sub(begin)
-				rtt := ds.rtt(lim.rate(), sched(t), t)
+				rtt := ds.rtt(lim.rate(), sched(t), t, seq.Add(1))
 				time.Sleep(rtt)
 				elapsed := time.Since(start)
 				lim.observe(elapsed)

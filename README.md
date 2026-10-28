@@ -268,7 +268,7 @@ Each tick:
    - `fast >= high` → congested, proportional decrease `1 - Gain*(excess/high)`,
      capped at `-DownStep`.
    - in between → hold (deadband).
-4. If p99 exceeds `SLOTarget`, force a full `-DownStep`.
+4. If p99 exceeds `SLOTarget x TailFactor`, force a full `-DownStep`.
 5. Clamp to `[MinRate, MaxRate]` and push to the bucket.
 
 **Asymmetry is intentional**: back off fast (30%/tick), ramp up slowly (5%/tick).
@@ -589,6 +589,87 @@ These are properties of the control law and of the deployment, not of the signal
   sizing `MaxRate` for a *cold* origin, not a better classifier.
 - **Many instances.** Each process converges on its own; there is no shared view
   of a shared dependency.
+
+## Signal hygiene: what must not enter the sample
+
+Everything above is about which *policy* a duration is subject to. This section is
+about whether the duration measures the downstream at all. The controller has one
+input and no way to tell a meaningful sample from a misleading one, so
+`compare/pollution_test.go` measures the cost of getting it wrong. Every arm runs
+against a **flat** downstream — latency independent of rate — which means no rate
+change in it can be congestion by construction. The control arm is the same
+limiter with the pollution removed:
+
+| sample stream | control | polluted | what happened |
+|---|---:|---:|---|
+| 80% of requests answer in 1ms (cache hits) | 135/s | 136/s | no damage: the miss path could not saturate |
+| 5% of requests always cost 300ms | 136/s | **54/s** | the tail guard read a fixed population as congestion |
+| an internal retry doubles the sample | 135/s | **24/s, 0% in SLO** | the absolute check compared twice the real latency |
+| 20ms of caller work, sample stays under `SLOTarget` | 136/s | 136/s | no damage: window and signal shift together |
+| 50ms of caller work, sample crosses `SLOTarget` | 135/s | **24/s, 0% in SLO** | same pollution, now it trips the guard |
+
+**The relative window is self-correcting; the guard is not.** In every row that
+collapsed, the median law said *healthy*: a constant offset moves `fast` and
+`slow` together, and a ratio does not care about it. The absolute comparison
+does, and it turns a polluted sample into a 30%-per-tick backoff straight to
+`MinRate`.
+
+**The guard compares one tick's p99 against `SLOTarget`.** A SLO is a fraction
+over a long window ("99% of requests under 200ms"); a per-tick p99 crossing that
+number is *normal* for a service that meets it — roughly half the ticks. And half
+the ticks is enough to walk the rate to the floor, because `0.70 x 1.05 < 1`.
+Measured on a downstream with no queueing at all: 5% of requests that always cost
+300ms took 300 req/s to 21.
+
+`TailFactor` (default 1.0 — the guard fires at the SLO itself) moves that
+threshold and nothing else. Set it to 1.5–2 when your tail is made of different
+request types rather than of queueing: `SLOTarget` stays the number in the
+contract, the window cap and the `AnchorSLO` target stay where they are, and only
+the guard gets room.
+
+`TailTolerance` (default 0 — off) changes the guard's *statistic* instead: it fires
+when the smoothed **fraction of the tick above the target** exceeds the tolerance
+by more than three standard errors. The caller supplies the policy (how much slow
+traffic is acceptable) and the controller supplies the evidence bar, derived from
+the sample count it actually has — so a busy service gets a tight margin and a
+quiet one gets a wide one, because a quiet service measures less. That is the
+difference between "5% of my traffic is a report endpoint" and "everything got
+slower":
+
+| 5% of requests always cost 300ms | achieved/s | %<=SLO | rate |
+|---|---:|---:|---:|
+| `TailTolerance` 0 (p99 test) | 54 | 94% | **21** |
+| `TailTolerance` 0.05 | 136 | 95% | **300** |
+| `TailTolerance` 0.10 | 135 | 95% | 300 |
+
+A tolerance set *at* the cohort's share holds, because the margin absorbs the
+sampling noise — there is no headroom factor to tune. And when *every* request
+costs 300ms all three settings still take the rate to `MinRate` (25 req/s, 0%
+inside the SLO), so the protection is intact.
+
+`Stats().TailThreshold` is the derived bar (`tol + 3σ`), wider exactly where the
+sample count is small. The sweep in `compare` (`TestTailMargin`) measures 0.149 at
+~8 samples per tick, 0.105 at ~24 and 0.098 at ~33, with no false positive at any
+of them. The same sweep shows where the evidence runs out: a cohort three points
+above the tolerance is not resolvable at ~24 samples per tick, and the guard stays
+quiet rather than guessing.
+
+The shape of the fix is always the same — decide what the number means *before*
+it reaches `Observe`:
+
+| if a sample can be… | then |
+|---|---|
+| a cache hit, a health check, a CORS preflight | classify it `Aborted`; it says nothing about remaining capacity |
+| a different endpoint with its own latency profile | give it its own limiter; do not average two populations into one p50 |
+| a retried attempt | use `Take`/`Observe` per attempt — `Do` measures exactly one attempt by definition |
+| caller-side work (marshal, lock waits, GC) | measure only the call, and remember that the overhead eats your SLO headroom |
+| an attempt truncated by *your* deadline | make sure the deadline is longer than `SLOTarget`: a shorter one caps every sample, and the limiter goes blind above it |
+
+That last row is the one that fails quietly. `DeadlineExceeded` is deliberately
+recorded as a real round trip (a downstream that times out *is* struggling), but
+if the deadline is shorter than the downstream's healthy latency, every sample
+becomes the deadline: a flat line at 30ms that looks perfectly healthy while every
+request fails. The limiter will happily raise the rate into it.
 
 ## Pitfalls (read before tuning)
 

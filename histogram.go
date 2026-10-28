@@ -88,6 +88,18 @@ func subBucketLower(idx int) time.Duration {
 // snapshot returns the (approximate) p50 and p99 for the observations recorded
 // since the previous snapshot, then resets the histogram.
 func (h *histogram) snapshot() (p50, p99 time.Duration, n uint64) {
+	p50, p99, n, _ = h.snapshotAbove(0)
+	return p50, p99, n
+}
+
+// snapshotAbove is snapshot plus a count of the observations above tail, when
+// tail > 0. That count is what the ratio-based tail guard needs: "how much of
+// this tick was slow" is a different question from "how slow was the 99th
+// percentile", and only the first one can tell a heterogeneous population (5% of
+// requests are a report endpoint) from queueing (everything got slower).
+//
+// The histogram is reset either way, so this is a read-and-drain, not a peek.
+func (h *histogram) snapshotAbove(tail time.Duration) (p50, p99 time.Duration, n, above uint64) {
 	var counts [histBuckets]uint64
 	for i := range h.counts {
 		c := h.counts[i].Swap(0)
@@ -96,9 +108,31 @@ func (h *histogram) snapshot() (p50, p99 time.Duration, n uint64) {
 	}
 	h.total.Swap(0)
 	if n == 0 {
-		return 0, 0, 0
+		return 0, 0, 0, 0
 	}
-	return quantile(&counts, n, 0.50), quantile(&counts, n, 0.99), n
+	p50 = quantile(&counts, n, 0.50)
+	p99 = quantile(&counts, n, 0.99)
+	if tail > 0 {
+		above = aboveCount(&counts, uint64(tail))
+	}
+	return p50, p99, n, above
+}
+
+// aboveCount returns how many observations are above v.
+//
+// Buckets are ordered by their lower bound, so this walks down from the top and
+// stops at the first bucket that could contain v. That bucket cannot be split, so
+// it is counted as *not* above: the count errs low by at most one bucket per
+// tick, the same floor-quantisation the quantiles themselves have.
+func aboveCount(counts *[histBuckets]uint64, v uint64) uint64 {
+	var above uint64
+	for i := histBuckets - 1; i >= 0; i-- {
+		if uint64(subBucketLower(i)) <= v {
+			break
+		}
+		above += counts[i]
+	}
+	return above
 }
 
 // quantile returns the lower bound of the bucket containing the q-th value,

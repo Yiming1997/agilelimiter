@@ -20,7 +20,7 @@ func TestPresetNoneChangesNothing(t *testing.T) {
 	}
 	if none.Tick != time.Second || none.FastHalfLife != 3*time.Second ||
 		none.SlowHalfLife != 45*time.Second || none.Anchor != "baseline" ||
-		none.BackoffTicks != 1 || none.RecoverTicks != 1 || none.RecoverRamp != 0 {
+		none.BackoffTicks != 1 || none.RecoverTicks != 1 {
 		t.Fatalf("shipped defaults changed: %+v", none)
 	}
 	if none.Window != "2.00x baseline" {
@@ -110,7 +110,6 @@ func TestValidate(t *testing.T) {
 		{"downstep over one", Config{MaxRate: 120, DownStep: 1.2}, "DownStep"},
 		{"tick too long", Config{MaxRate: 120, Tick: 30 * time.Second}, "Tick"},
 		{"half life under tick", Config{MaxRate: 120, Tick: time.Second, FastHalfLife: time.Second}, "FastHalfLife"},
-		{"recover ramp out of range", Config{MaxRate: 120, RecoverRamp: 2}, "RecoverRamp"},
 		{"negative slow start", Config{MaxRate: 120, SlowStartGain: 0.5}, "SlowStartGain"},
 	}
 

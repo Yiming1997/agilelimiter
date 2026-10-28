@@ -282,14 +282,13 @@ controller does not know where the knee is, so `+5%/tick` is guessing very slowl
 costs 6. The asymmetry above is exactly what makes this safe — overshooting costs
 two ticks to correct, undershooting costs eighty.
 
-The cold-start flag clears on the first backoff and never re-arms, which would
-leave a limiter at `MinRate` climbing at `UpStep`: a dip that took 8 ticks to
-fall into would take 80 to climb out of. `Config.RecoverRamp` is the opt-in
-answer — set it to 0.5 and the multiplicative probe returns whenever the measured
-latency sits at or below *half* the tolerated window. It is **off by default**,
-and the matrix below shows why: it turns 25 req/s into 52 when capacity comes
-back, and 59 into 46 when capacity drops, because doubling is also how you
-overshoot a cliff.
+The cold-start flag clears on the first backoff and never re-arms, so a limiter
+that has dipped to `MinRate` climbs at `UpStep`: a dip that took 8 ticks to fall
+into takes 80 to climb out of. We tried re-arming the multiplicative probe when
+the measured latency sat at or below *half* the window, measured it, and removed
+it again — it turns 25 req/s into 52 when capacity comes back and 59 into 46 when
+capacity drops, because doubling is also how you overshoot a cliff. Recovery stays
+additive; `docs/design.md` §9.6 has the numbers and the reasoning.
 
 ## Choosing what "congested" is measured against
 
@@ -368,9 +367,9 @@ Read `%<=SLO` alongside goodput, not goodput alone. What it says:
   being told the capacity. That is what the trade buys.
 - **Their weak spot is recovery, not backoff.** 40 -> 150 req/s costs them the
   scenario outright (25 vs 98), because `coldStart` does not re-arm and the
-  climb is `UpStep` per tick. `Config.RecoverRamp` is the opt-in answer: at 0.5
-  that scenario goes 25 -> 52, and the capacity-drop one goes 59 -> 46, because
-  doubling is also how you overshoot a cliff. It ships off for that reason.
+  climb is `UpStep` per tick. Making that ramp multiplicative again fixed it
+  (25 -> 52) and broke the capacity-drop scenario (59 -> 46), so it was removed
+  rather than shipped — see `docs/design.md` §9.6.
 - `AnchorSLO` is the steadier of the two modes (flapping latency: 112-113 req/s
   in both rounds, against 95-105), and it is the one that survives a benign bump
   once the SLO has real headroom.
@@ -579,12 +578,12 @@ These are properties of the control law and of the deployment, not of the signal
   outruns it.
 - **Cold start and recovery.** A *fresh* limiter doubles while it has never seen
   congestion (`SlowStartGain`, default 2.0), so it finds the knee in
-  `log2(MaxRate/InitialRate)` ticks — 6 instead of 80 for 10→500. Recovery from a
-  deep dip is the same shape (`RecoverRamp`): once the observed latency is at or
-  below half the tolerated window the multiplicative probe returns, because
-  nothing about that reading is ambiguous. What is left to you is a limiter that
-  *restarts* cold and has to re-learn a knee it already knew — persist the last
-  good rate across restarts for that.
+  `log2(MaxRate/InitialRate)` ticks — 6 instead of 80 for 10→500. Recovery is not
+  symmetric: a limiter that has already backed off climbs at `UpStep`, so coming
+  back costs `ln(MaxRate/MinRate)` ticks. Re-arming the doubling was implemented,
+  measured and rejected — it fixes recovery and breaks the backoff (§9.6 of the
+  design notes). What is left to you is a limiter that *restarts* cold and has to
+  re-learn a knee it already knew — persist the last good rate across restarts.
 - **A cache going cold.** That is a step change; the backstop is single-flight and
   sizing `MaxRate` for a *cold* origin, not a better classifier.
 - **Many instances.** Each process converges on its own; there is no shared view

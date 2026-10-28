@@ -152,14 +152,11 @@ func (c *controller) step() {
 		if c.below < c.cfg.RecoverTicks {
 			break // not yet enough agreement to spend a probe
 		}
-		// Healthy: probe up. Additively, unless a multiplicative probe is
-		// warranted — either because we have never seen congestion (we do not know
-		// where the knee is, so doubling finds it in log2 ticks), or because the
-		// latency has come back to half the tolerated window (we know exactly
-		// where the knee is, and we are nowhere near it). Overshooting on the way
-		// up is cheap (DownStep is 0.30, so two ticks bring us back);
-		// undershooting is not (UpStep is 0.05).
-		if c.rampUp(high) {
+		// Healthy: probe up. Additively, unless we have never seen congestion — then
+		// we do not know where the knee is and doubling finds it in log2 ticks.
+		// Overshooting on the way up is cheap (DownStep is 0.30, so two ticks bring
+		// us back); undershooting is not (UpStep is 0.05).
+		if c.rampUp() {
 			factor = c.cfg.SlowStartGain
 		} else {
 			factor = 1 + c.cfg.UpStep
@@ -229,23 +226,16 @@ func (c *controller) step() {
 }
 
 // rampUp reports whether this healthy tick should probe multiplicatively rather
-// than additively.
+// than additively: only while the limiter has never seen congestion, because then
+// it has no idea where the knee is and doubling finds it in log2 ticks.
 //
-// Two cases qualify. Cold start: the limiter has never seen congestion, so it
-// has no idea where the knee is. The other is recovery, and it is opt-in: the
-// observed latency is at or below RecoverRamp of the tolerated window, which
-// means the downstream is not merely healthy but far from the knee — the
-// situation after it comes back from an outage, when an additive ramp would
-// take ln(MaxRate/MinRate) ticks to undo a backoff that took a handful.
-//
-// The recovery case is off by default (RecoverRamp == 0) because doubling is
-// also how you overshoot, and overshooting a downstream whose latency curve is
-// a cliff is expensive. See Config.RecoverRamp for the measured trade-off.
-func (c *controller) rampUp(high float64) bool {
-	if c.cfg.SlowStartGain <= 1 {
-		return false
-	}
-	return c.coldStart || c.fast <= high*c.cfg.RecoverRamp
+// It used to also fire on recovery — latency far below the window — and that was
+// removed. It bought 25 -> 52 req/s when capacity came back and cost 59 -> 46 when
+// capacity dropped, because doubling is also how you overshoot a cliff; a half
+// measure with a real downside is worse than a documented "we do not do this".
+// See docs/design.md §9.6 for the numbers.
+func (c *controller) rampUp() bool {
+	return c.coldStart && c.cfg.SlowStartGain > 1
 }
 
 // tailTarget is the latency at which the p99 guard fires, or zero when the guard

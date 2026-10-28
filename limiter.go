@@ -183,27 +183,6 @@ type Config struct {
 	BackoffTicks int
 	RecoverTicks int
 
-	// RecoverRamp is how far below the tolerated latency the observed latency
-	// has to be — and for how long — before the controller may probe
-	// multiplicatively again, even though it has already seen congestion.
-	//
-	// It exists for one case: the downstream came back. After a deep dip the rate
-	// sits at MinRate and the climb is UpStep per tick, so 5 -> 120 costs about
-	// 65 ticks — while SlowStartGain, which would do it in 5, is reserved for a
-	// limiter that has never seen congestion.
-	//
-	// It is **off by default** (0), and that is deliberate. Doubling is how you
-	// overshoot, and overshooting a downstream whose latency curve is a cliff is
-	// expensive: in the scenario matrix it buys 25 -> 52 req/s of goodput when
-	// capacity comes back, and costs 59 -> 46 when capacity drops, because the
-	// ramp walks straight back into the cliff. Turning it on is a statement that
-	// your downstream degrades gracefully and is more likely to recover than to
-	// fall further.
-	//
-	// 0.5 means "at most half the tolerated latency". 1.0 makes every healthy
-	// tick a multiplicative probe.
-	RecoverRamp float64
-
 	// Classify maps a failed call to what the controller is told about it. It is
 	// only consulted for non-nil errors; a nil error always means Reached.
 	//
@@ -407,9 +386,6 @@ func withDefaults(c Config) Config {
 		if sloAnchor {
 			c.RecoverTicks = 2
 		}
-	}
-	if c.RecoverRamp < 0 {
-		c.RecoverRamp = 0 // negative is meaningless; zero (the default) is "off"
 	}
 	if c.TailFactor <= 0 {
 		c.TailFactor = 1 // the guard fires at the SLO, which is the historical behaviour
@@ -687,7 +663,6 @@ type Resolved struct {
 
 	BackoffTicks int
 	RecoverTicks int
-	RecoverRamp  float64
 }
 
 // Config returns the configuration this limiter is actually running with.
@@ -721,7 +696,6 @@ func resolve(cfg Config, kind string) Resolved {
 		Deadband:         cfg.Deadband,
 		BackoffTicks:     cfg.BackoffTicks,
 		RecoverTicks:     cfg.RecoverTicks,
-		RecoverRamp:      cfg.RecoverRamp,
 	}
 
 	sloWindow := time.Duration(float64(cfg.SLOTarget) * sloWindowFraction)
@@ -816,9 +790,6 @@ func (c Config) Validate() error {
 	}
 	if c.BackoffTicks < 0 || c.RecoverTicks < 0 {
 		add("BackoffTicks and RecoverTicks must not be negative")
-	}
-	if c.RecoverRamp < 0 || c.RecoverRamp > 1 {
-		add("RecoverRamp %.3f must be within [0, 1]", c.RecoverRamp)
 	}
 	if c.MaxBaselineRise < 0 {
 		add("MaxBaselineRise %.4f must not be negative", c.MaxBaselineRise)

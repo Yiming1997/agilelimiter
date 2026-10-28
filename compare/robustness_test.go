@@ -45,6 +45,10 @@ type probeCfg struct {
 	// ablation below tells the two apart.
 	tailFactor float64
 
+	// backoffTicks is the median law's time hysteresis: 1 (the default) spends a
+	// step on the first bad tick, 2 requires agreement.
+	backoffTicks int
+
 	workers int
 }
 
@@ -115,6 +119,7 @@ func driveProbe(cfg probeCfg, shape shapeAt, dur time.Duration) probeOut {
 		SLOTarget:     cfg.slo,
 		TailTolerance: cfg.tol,
 		TailFactor:    cfg.tailFactor,
+		BackoffTicks:  cfg.backoffTicks,
 		Anchor:        cfg.anchor,
 		Preset:        cfg.preset,
 		FastHalfLife:  750 * time.Millisecond,
@@ -514,6 +519,137 @@ func TestRobustLongStall(t *testing.T) {
 		fmt.Printf("%5.0f", out.rateAt[i])
 	}
 	fmt.Println("\n  (blocks run t=2..7, 12..17, 22..27)")
+}
+
+// --- TestRobustFlapping ------------------------------------------------
+
+// blocks returns a shape where the downstream is wedged for `length` out of
+// every `period`, starting at `start`. A request that arrives during a block
+// returns when the block ends.
+func blocks(start, period, length time.Duration) shapeAt {
+	return func(el time.Duration, _ float64, _ uint64) time.Duration {
+		if el < start {
+			return 24 * time.Millisecond
+		}
+		in := (el - start) % period
+		if in < length {
+			return length - in + 24*time.Millisecond
+		}
+		return 24 * time.Millisecond
+	}
+}
+
+// partialBlocks wedges only `pct` percent of requests: half the shards down, a
+// lock that one code path takes, a cohort that shares a saturated dependency.
+func partialBlocks(start, period, length time.Duration, pct int) shapeAt {
+	full := blocks(start, period, length)
+	return func(el time.Duration, util float64, seq uint64) time.Duration {
+		if inCohort(seq, pct) {
+			return full(el, util, seq)
+		}
+		return 24 * time.Millisecond
+	}
+}
+
+// TestRobustFlapping asks whether blocks that are too frequent to recover from
+// ratchet the rate down, and where the boundary is. One block costs one -30%
+// cut and about 5s of reduced throughput; if blocks arrive faster than that, the
+// cuts should accumulate instead of cancelling out.
+func TestRobustFlapping(t *testing.T) {
+	const ceiling = 300.0
+	fmt.Println("flapping: one 1s block every P seconds, 20s run")
+	fmt.Println("each block used to cost one cut; the question is whether the climb keeps up")
+	fmt.Println()
+
+	for _, period := range []time.Duration{2 * time.Second, 3 * time.Second, 4 * time.Second, 6 * time.Second} {
+		out := driveProbe(probeCfg{rate: int(ceiling), tol: 0.05, slo: pollSLO},
+			blocks(2*time.Second, period, 1*time.Second), 22*time.Second)
+
+		fmt.Printf("  P=%2.0fs  rate:", period.Seconds())
+		for s := 2; s <= 21; s++ {
+			i := s * 10
+			if i >= len(out.rateAt) {
+				break
+			}
+			fmt.Printf("%4.0f", out.rateAt[i])
+		}
+		fmt.Printf("   min %.0f  end %.0f\n", out.minAfter(2*time.Second), out.last())
+	}
+
+	fmt.Println()
+	fmt.Println("a cut costs ln(1/0.7)/ln(1.05) = 7.3 ticks (1.8s) to undo, plus ~3s while")
+	fmt.Println("fast decays; below that period the rate must ratchet.")
+
+	// A block produces exactly one bad tick — the burst of samples that arrives
+	// when it ends — so requiring two consecutive bad ticks should make it free.
+	// That is the whole question: does BackoffTicks=2 buy the flapping case, and
+	// what does it cost on a real overload?
+	fmt.Println()
+	fmt.Println("same, with BackoffTicks=2 (two consecutive bad ticks required)")
+	for _, period := range []time.Duration{2 * time.Second, 3 * time.Second, 4 * time.Second} {
+		out := driveProbe(probeCfg{rate: int(ceiling), tol: 0.05, slo: pollSLO, backoffTicks: 2},
+			blocks(2*time.Second, period, 1*time.Second), 22*time.Second)
+		fmt.Printf("  P=%2.0fs  min %3.0f  end %3.0f\n", period.Seconds(), out.minAfter(2*time.Second), out.last())
+	}
+}
+
+// TestRobustPartialBlock is the case a latency-only controller cannot win: part
+// of the traffic is stuck for reasons that have nothing to do with load, so the
+// rate cut cannot fix it and every tick is over the policy line. The interesting
+// question is where the cliff is, and what it costs afterwards.
+func TestRobustPartialBlock(t *testing.T) {
+	const ceiling = 300.0
+	fmt.Println("partial block: 5s wedged every 12s, only `pct` percent of requests affected")
+	fmt.Println()
+	fmt.Printf("  %6s %10s %10s %10s %10s %10s\n",
+		"cohort", "rate@end", "+2s", "+5s", "+8s", "end")
+
+	for _, pct := range []int{5, 10, 20, 50} {
+		start := 2 * time.Second
+		end := start + 5*time.Second
+		out := driveProbe(probeCfg{rate: int(ceiling), tol: 0.05, slo: pollSLO},
+			partialBlocks(start, 12*time.Second, 5*time.Second, pct), 22*time.Second)
+
+		at := func(d time.Duration) float64 {
+			i := int(d / (100 * time.Millisecond))
+			if i < 0 || i >= len(out.rateAt) {
+				return 0
+			}
+			return out.rateAt[i]
+		}
+		fmt.Printf("  %5d%% %10.0f %10.0f %10.0f %10.0f %10.0f   meanOver %.2f\n",
+			pct, at(end), at(end+2*time.Second), at(end+5*time.Second),
+			at(end+8*time.Second), out.last(), out.meanOver())
+	}
+
+	fmt.Println()
+	fmt.Println("the cliff is the same one as everywhere else: tol + 3*sigma. Below it the")
+	fmt.Println("policy says ignore; above it the policy says back off, and the rate cut cannot")
+	fmt.Println("help because the slowness is not caused by load.")
+}
+
+// TestRobustFlappingAblation asks which component does the cutting when blocks
+// arrive faster than the climb. BackoffTicks=2 changes nothing, which already
+// says it is not the median law; muting the guard should say the rest.
+func TestRobustFlappingAblation(t *testing.T) {
+	const ceiling = 300.0
+	fmt.Println("flapping at P=2s, one 1s block every 2s: which component cuts?")
+	fmt.Println()
+
+	arms := []struct {
+		label string
+		cfg   probeCfg
+	}{
+		{"tol 5% (baseline)", probeCfg{rate: int(ceiling), tol: 0.05, slo: pollSLO}},
+		{"tol 5% + BackoffTicks 2", probeCfg{rate: int(ceiling), tol: 0.05, slo: pollSLO, backoffTicks: 2}},
+		{"tol 5% + guard muted", probeCfg{rate: int(ceiling), tol: 0.05, slo: pollSLO, tailFactor: 100}},
+		{"tol 5% + both muted", probeCfg{rate: int(ceiling), tol: 0.05, slo: pollSLO, tailFactor: 100, backoffTicks: 2}},
+		{"tol 0 (quantile guard)", probeCfg{rate: int(ceiling), tol: 0, slo: pollSLO}},
+	}
+	for _, a := range arms {
+		out := driveProbe(a.cfg, blocks(2*time.Second, 2*time.Second, 1*time.Second), 22*time.Second)
+		fmt.Printf("  %-22s min %3.0f  end %3.0f\n", a.label, out.minAfter(2*time.Second), out.last())
+	}
 }
 
 // --- TestRobustCongestion ----------------------------------------------

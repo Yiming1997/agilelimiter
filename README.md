@@ -71,6 +71,18 @@ wins. No preset touches `Tick` or the half-lives: those are the *scale* of the
 control law, and moving them silently re-tunes every gain — they stay available
 for anyone who has read `docs/design.md`.
 
+That is nearly the whole surface. Five fields are the configuration for most
+services; everything else lives in `Config` under banners that say what it costs
+to move:
+
+| field | why you would set it |
+|---|---|
+| `MaxRate` | required: the rate you promise the downstream |
+| `SLOTarget` | the red line — also enables the tail guard and the SLO anchor |
+| `Preset` | picks the policy: anchor, hysteresis, tolerated multiple |
+| `TailTolerance` | optional, set once: your tail is made of different request types |
+| `Classify` | correctness rather than tuning: which failures never reached the downstream |
+
 `Config()` returns a `Resolved` snapshot (defaults applied, presets expanded, an
 SLO anchor that could not be honoured reported rather than hidden). `Validate()`
 reports the configs `New` would otherwise repair in silence — `MinRate` above

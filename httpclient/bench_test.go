@@ -26,7 +26,6 @@ func (nopTransport) RoundTrip(*http.Request) (*http.Response, error) { return be
 func wrapBenchLimiter() *agilelimiter.Limiter {
 	return agilelimiter.New(agilelimiter.Config{
 		MinRate: 1, MaxRate: 1_000_000_000, InitialRate: 1_000_000_000,
-		Per: time.Nanosecond,
 	})
 }
 

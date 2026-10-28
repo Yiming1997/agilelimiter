@@ -47,8 +47,7 @@ func BenchmarkTryTakeRelease(b *testing.B) {
 // measure the OS timer: a 1ns request on Windows can cost hundreds of
 // microseconds, which says nothing about this code.
 func BenchmarkTakeNoPacing(b *testing.B) {
-	l := New(Config{MinRate: 1, MaxRate: 1_000_000_000, InitialRate: 1_000_000_000,
-		Per: time.Nanosecond})
+	l := New(Config{MinRate: 1, MaxRate: 1_000_000_000, InitialRate: 1_000_000_000})
 	b.ReportAllocs()
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {

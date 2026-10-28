@@ -49,6 +49,11 @@ type probeCfg struct {
 	// step on the first bad tick, 2 requires agreement.
 	backoffTicks int
 
+	// tick and fastHalfLife default to the harness's 250ms/750ms, which is four
+	// times faster than the library's; the default-scale test below sets them.
+	tick         time.Duration
+	fastHalfLife time.Duration
+
 	workers int
 }
 
@@ -112,6 +117,12 @@ func driveProbe(cfg probeCfg, shape shapeAt, dur time.Duration) probeOut {
 	if workers == 0 {
 		workers = 120
 	}
+	if cfg.tick == 0 {
+		cfg.tick = 250 * time.Millisecond
+	}
+	if cfg.fastHalfLife == 0 {
+		cfg.fastHalfLife = 750 * time.Millisecond
+	}
 	lim := agilelimiter.New(agilelimiter.Config{
 		MinRate:       pollMin,
 		MaxRate:       cfg.rate,
@@ -122,9 +133,9 @@ func driveProbe(cfg probeCfg, shape shapeAt, dur time.Duration) probeOut {
 		BackoffTicks:  cfg.backoffTicks,
 		Anchor:        cfg.anchor,
 		Preset:        cfg.preset,
-		FastHalfLife:  750 * time.Millisecond,
+		FastHalfLife:  cfg.fastHalfLife,
 		SlowHalfLife:  45 * time.Second,
-		Tick:          250 * time.Millisecond,
+		Tick:          cfg.tick,
 	})
 	lim.Start()
 	defer lim.Stop()
@@ -650,6 +661,37 @@ func TestRobustFlappingAblation(t *testing.T) {
 		out := driveProbe(a.cfg, blocks(2*time.Second, 2*time.Second, 1*time.Second), 22*time.Second)
 		fmt.Printf("  %-22s min %3.0f  end %3.0f\n", a.label, out.minAfter(2*time.Second), out.last())
 	}
+}
+
+// TestRobustFlappingDefaultScale repeats the flapping question at the time scale
+// the library ships with: Tick 1s, FastHalfLife 3s. The harness runs four times
+// faster, and the recovery window scales with the half-life rather than the tick,
+// so the boundary moves by 4x and the danger zone is much wider than the fast
+// runs suggest.
+func TestRobustFlappingDefaultScale(t *testing.T) {
+	const ceiling = 300.0
+	fmt.Println("flapping at the shipped time scale: Tick 1s, FastHalfLife 3s, 1s block every P")
+	fmt.Println()
+	fmt.Printf("  %6s %8s %8s   %s\n", "P", "min", "end", "verdict")
+
+	for _, period := range []time.Duration{3 * time.Second, 5 * time.Second, 10 * time.Second, 15 * time.Second, 20 * time.Second, 30 * time.Second} {
+		cfg := probeCfg{rate: int(ceiling), tol: 0.05, slo: pollSLO,
+			tick: time.Second, fastHalfLife: 3 * time.Second}
+		dur := period + 42*time.Second
+		out := driveProbe(cfg, blocks(2*time.Second, period, 1*time.Second), dur)
+
+		min, end := out.minAfter(2*time.Second), out.last()
+		verdict := "stable"
+		if end < 0.5*ceiling {
+			verdict = "RATCHETED"
+		}
+		fmt.Printf("  %5.0fs %8.0f %8.0f   %s\n", period.Seconds(), min, end, verdict)
+	}
+
+	fmt.Println()
+	fmt.Println("recovery after one cut = 7.3 ticks to undo it, plus the time fast needs to")
+	fmt.Println("decay below the window: ~10s at the shipped 3s half-life. That is the period")
+	fmt.Println("below which a stalling dependency ratchets.")
 }
 
 // --- TestRobustCongestion ----------------------------------------------

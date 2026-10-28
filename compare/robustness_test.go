@@ -424,6 +424,98 @@ func TestRobustRecovery(t *testing.T) {
 	}
 }
 
+// --- TestRobustLongStall ------------------------------------------------
+
+// TestRobustLongStall models the thing a one-second stall does not: a downstream
+// that stops answering for seconds at a time — a wedged lock, a stop-the-world
+// pause, a network partition. A request that arrives during the block returns
+// when the block ends, so its latency is "time left in the block", and the
+// sample stream dries up after the first tick because every worker is inside it.
+//
+// Two questions, and they have different answers: what the rate does *during*
+// the block (the controller goes blind when no samples arrive), and how long it
+// takes to come back afterwards (the climb is UpStep per tick, and fast has to
+// decay first).
+func TestRobustLongStall(t *testing.T) {
+	const ceiling = 300.0
+	const blockSLO = pollSLO
+
+	fmt.Println("long stall: the downstream stops answering for D seconds (2s warmup, 8s after)")
+	fmt.Println("latency during the block = time left in the block, so p50 ~= D/2")
+	fmt.Println()
+	fmt.Printf("  %6s %14s %10s %10s %10s %10s  %s\n",
+		"block", "rate@end", "+1s", "+2s", "+4s", "+8s", "back to 90%")
+
+	for _, block := range []time.Duration{0, 1 * time.Second, 2 * time.Second, 5 * time.Second, 10 * time.Second} {
+		start := 2 * time.Second
+		end := start + block
+		shape := func(el time.Duration, _ float64, _ uint64) time.Duration {
+			if el >= start && el < end {
+				return end - el + 24*time.Millisecond // wedged until the block ends
+			}
+			return 24 * time.Millisecond
+		}
+		cfg := probeCfg{rate: int(ceiling), tol: 0.05, slo: blockSLO}
+		out := driveProbe(cfg, shape, end+8*time.Second)
+
+		at := func(d time.Duration) float64 {
+			i := int(d / (100 * time.Millisecond))
+			if i < 0 || i >= len(out.rateAt) {
+				return 0
+			}
+			return out.rateAt[i]
+		}
+
+		back := "never in window"
+		for i := int(end / (100 * time.Millisecond)); i < len(out.rateAt); i++ {
+			if out.rateAt[i] >= 0.90*ceiling {
+				back = fmt.Sprintf("%.1fs", float64(i)*0.1-end.Seconds())
+				break
+			}
+		}
+
+		label := "none"
+		if block > 0 {
+			label = fmt.Sprintf("%4.0fs", block.Seconds())
+		}
+		fmt.Printf("  %6s %14.0f %10.0f %10.0f %10.0f %10.0f  %s\n",
+			label, at(end), at(end+1*time.Second), at(end+2*time.Second),
+			at(end+4*time.Second), at(end+8*time.Second), back)
+	}
+
+	fmt.Println()
+	fmt.Println("a block is not one event: it is one cut, then a blind hold while fast decays,")
+	fmt.Println("then the ordinary additive climb. The climb is the expensive part.")
+
+	// Repeated blocks: the climb gets 5s between them, which is roughly the
+	// recovery time of a single block. If the damage accumulated, the rate would
+	// ratchet down with a flapping downstream.
+	fmt.Println()
+	fmt.Println("repeated: 5s block, 5s clean, three times")
+	repeat := func(el time.Duration, _ float64, _ uint64) time.Duration {
+		// blocks at [2,7), [12,17), [22,27)
+		if s := el.Seconds(); s >= 2 && s < 27 && int(s)%10 >= 2 && int(s)%10 < 7 {
+			end := time.Duration(int(s)/10*10+7) * time.Second
+			return end - el + 24*time.Millisecond
+		}
+		return 24 * time.Millisecond
+	}
+	out := driveProbe(probeCfg{rate: int(ceiling), tol: 0.05, slo: blockSLO}, repeat, 34*time.Second)
+	fmt.Printf("  %-6s", "t")
+	for s := 0; s <= 33; s++ {
+		fmt.Printf("%5d", s)
+	}
+	fmt.Printf("\n  %-6s", "rate")
+	for s := 0; s <= 33; s++ {
+		i := s * 10
+		if i >= len(out.rateAt) {
+			break
+		}
+		fmt.Printf("%5.0f", out.rateAt[i])
+	}
+	fmt.Println("\n  (blocks run t=2..7, 12..17, 22..27)")
+}
+
 // --- TestRobustCongestion ----------------------------------------------
 
 // TestRobustCongestion is the other half of the contract: a downstream that DOES

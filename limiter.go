@@ -46,12 +46,22 @@ const (
 	AnchorSLO
 )
 
+// rateWindow is the window a rate is expressed over. Every rate in this package
+// means requests per second; it used to be a Config field, which only invited the
+// question "can I express this per minute?" — you cannot.
+const rateWindow = time.Second
+
 // Config configures a Limiter. Zero fields take sensible defaults (see withDefaults).
+//
+// The fields are grouped by who should decide them. The first group is the whole
+// configuration for most services; the rest are escape hatches, and each banner
+// says what it costs to move them.
 type Config struct {
+	// ── what you must decide ─────────────────────────────────────────────
+
 	// Preset fills the *policy* fields you leave at zero: the anchor, the tick
-	// hysteresis, the tolerated multiple, the fast-recovery threshold. Supply
-	// MaxRate — and, for PresetLatencyFirst, SLOTarget — and nothing else to get
-	// a tuned limiter.
+	// hysteresis, the tolerated multiple. Supply MaxRate — and, for
+	// PresetLatencyFirst, SLOTarget — and nothing else to get a tuned limiter.
 	//
 	// Zero (PresetNone) fills nothing, so a config without a preset behaves
 	// exactly as it did before presets existed. Any field you set explicitly
@@ -59,7 +69,11 @@ type Config struct {
 	Preset Preset
 
 	// MinRate and MaxRate bound the dynamic rate, in requests per second.
-	// MaxRate is the *hard ceiling* you are willing to promise.
+	// MaxRate is the *hard ceiling* you are willing to promise — the one number
+	// the caller must supply. MinRate is the outage probe rate: the rate the
+	// limiter keeps retrying at when the downstream is down, so it must be small
+	// enough for the downstream to absorb (times your instance count) and big
+	// enough that recovery is noticed quickly. Its default of 1 is fine.
 	MinRate int
 	MaxRate int
 	// InitialRate is the starting rate. When zero it is derived from MaxRate
@@ -67,8 +81,6 @@ type Config struct {
 	// comes down fast and goes up slowly, so guessing high costs a couple of
 	// ticks while guessing low costs ln(MaxRate/MinRate) of them.
 	InitialRate int
-	// Per is the time window the rate is expressed over. Default: one second.
-	Per time.Duration
 
 	// SLOTarget enables the tail-latency guard: when the per-tick p99 exceeds
 	// it, the controller forces a full backoff step. Zero disables the guard.
@@ -79,6 +91,8 @@ type Config struct {
 	// BackoffTicks: a tail that blows through the SLO is a safety valve, and
 	// delaying it one tick is not worth the noise it would filter.
 	SLOTarget time.Duration
+
+	// ---- the tail guard: optional, and worth one look ----
 
 	// TailFactor scales SLOTarget for the tail guard only: the guard fires when
 	// the per-tick p99 exceeds SLOTarget x TailFactor. The window cap
@@ -116,10 +130,31 @@ type Config struct {
 	// request in a quiet tick decays instead of punishing the rate.
 	TailTolerance float64
 
+	// ---- policy: a Preset sets these; override only if you disagree ----
+
 	// Anchor chooses what the backoff threshold is measured against: the
 	// downstream's own fastest latency (the default) or the absolute SLO. See
 	// Anchor for what each one buys and costs.
 	Anchor Anchor
+
+	// BackoffTicks and RecoverTicks are the time hysteresis: the rate only moves
+	// after that many *consecutive* ticks agree about which side of the window
+	// the latency is on. This is CoDel's interval idea reduced to a counter, and
+	// it is the cheapest defence against a noisy signal: with the asymmetric
+	// steps (-DownStep vs +UpStep) a single-tick spike and a single-tick dip do
+	// not cancel out — they ratchet the rate down — so filtering them by
+	// agreement matters more than the size of the steps.
+	//
+	// A tick in the deadband resets both counters: the two sides must agree in a
+	// row, not merely add up.
+	//
+	// Zero takes the default: 1 (no hysteresis, the historical behaviour) under
+	// AnchorBaseline, and 2 under AnchorSLO, where the threshold is fixed and
+	// jitter across it is therefore the main false-positive risk.
+	BackoffTicks int
+	RecoverTicks int
+
+	// ---- the scale of the control law: moving these re-tunes every gain ----
 
 	// EWMA half-lives for the control signal.
 	FastHalfLife     time.Duration // recent latency
@@ -166,22 +201,7 @@ type Config struct {
 	// Deadband is the hold band around the target latency, as a fraction of it.
 	Deadband float64
 
-	// BackoffTicks and RecoverTicks are the time hysteresis: the rate only moves
-	// after that many *consecutive* ticks agree about which side of the window
-	// the latency is on. This is CoDel's interval idea reduced to a counter, and
-	// it is the cheapest defence against a noisy signal: with the asymmetric
-	// steps (-DownStep vs +UpStep) a single-tick spike and a single-tick dip do
-	// not cancel out — they ratchet the rate down — so filtering them by
-	// agreement matters more than the size of the steps.
-	//
-	// A tick in the deadband resets both counters: the two sides must agree in a
-	// row, not merely add up.
-	//
-	// Zero takes the default: 1 (no hysteresis, the historical behaviour) under
-	// AnchorBaseline, and 2 under AnchorSLO, where the threshold is fixed and
-	// jitter across it is therefore the main false-positive risk.
-	BackoffTicks int
-	RecoverTicks int
+	// ---- correctness, not tuning ----
 
 	// Classify maps a failed call to what the controller is told about it. It is
 	// only consulted for non-nil errors; a nil error always means Reached.
@@ -195,6 +215,8 @@ type Config struct {
 	// Aborted for caller-side cancellations, which say nothing about the
 	// downstream at all.
 	Classify func(err error) Outcome
+
+	// ---- test seam ----
 
 	// Clock defaults to the real clock. Inject a fake one in tests.
 	Clock Clock
@@ -313,9 +335,6 @@ func withDefaults(c Config) Config {
 	if c.Anchor == AnchorUnset {
 		c.Anchor = AnchorBaseline
 	}
-	if c.Per <= 0 {
-		c.Per = time.Second
-	}
 	if c.MinRate < 1 {
 		c.MinRate = 1
 	}
@@ -417,7 +436,7 @@ type Limiter struct {
 // ctrl.step yourself, as tests do).
 func New(cfg Config) *Limiter {
 	cfg = withDefaults(cfg)
-	b := newBucket(cfg.InitialRate, cfg.Per, cfg.Clock)
+	b := newBucket(cfg.InitialRate, rateWindow, cfg.Clock)
 	h := &histogram{}
 	l := &Limiter{
 		cfg:    cfg,
@@ -425,7 +444,7 @@ func New(cfg Config) *Limiter {
 		hist:   h,
 		stop:   make(chan struct{}),
 	}
-	l.ctrl = newController(cfg, h, func(rate int) { b.setRate(rate, cfg.Per) })
+	l.ctrl = newController(cfg, h, func(rate int) { b.setRate(rate, rateWindow) })
 	return l
 }
 
@@ -629,7 +648,6 @@ type Resolved struct {
 	MaxRate     int
 	MinRate     int
 	InitialRate int
-	Per         time.Duration
 
 	// Anchor is "baseline", "slo", or "baseline (AnchorSLO requested without
 	// SLOTarget)". The last form is a config that asked for the absolute anchor
@@ -679,7 +697,6 @@ func resolve(cfg Config, kind string) Resolved {
 		MaxRate:          cfg.MaxRate,
 		MinRate:          cfg.MinRate,
 		InitialRate:      cfg.InitialRate,
-		Per:              cfg.Per,
 		SLOTarget:        cfg.SLOTarget,
 		TailFactor:       cfg.TailFactor,
 		TailTolerance:    cfg.TailTolerance,

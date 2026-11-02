@@ -33,6 +33,7 @@ type controller struct {
 	cfg     Config
 	hist    *histogram
 	setRate func(rate int)
+	simple  bool
 
 	fast  float64 // fast EWMA of p50, nanoseconds
 	slow  float64 // slow EWMA baseline of p50, nanoseconds
@@ -73,6 +74,7 @@ func newController(cfg Config, hist *histogram, setRate func(rate int)) *control
 		cfg:           cfg,
 		hist:          hist,
 		setRate:       setRate,
+		simple:        cfg.Simple,
 		rate:          float64(cfg.InitialRate),
 		coldStart:     true,
 		fastAlpha:     ewmaAlpha(cfg.FastHalfLife, cfg.Tick),
@@ -98,6 +100,16 @@ func ewmaAlpha(halfLife, dt time.Duration) float64 {
 func (c *controller) step() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
+	if c.simple {
+		p50, p99, n, above := c.hist.snapshotAbove(c.snapshotTail())
+		c.lastP50, c.lastP99, c.lastSamples = p50, p99, n
+		if n == 0 {
+			return
+		}
+		c.stepSimple(p50, p99, n, above)
+		return
+	}
 
 	p50, p99, n, above := c.hist.snapshotAbove(c.snapshotTail())
 	// Retain what this tick saw for Stats. With no samples both quantiles are
@@ -234,6 +246,93 @@ func (c *controller) step() {
 	c.rate = clampRate(c.rate*factor, c.cfg.MinRate, c.cfg.MaxRate)
 	if c.rate >= float64(c.cfg.MaxRate) {
 		c.coldStart = false // nothing left to discover up there
+	}
+	c.setRate(int(math.Round(c.rate)))
+}
+
+// stepSimple is the approximate control law selected by Config.Simple.
+//
+// Compared with step it removes the fast EWMA, the proportional Gain, and the
+// binomial margin on the tail ratio. It keeps the two things that are hard to
+// replace: the asymmetric, rise-capped baseline and the cold-start ramp. The
+// median test uses this tick's p50 directly, with the existing tick counters as
+// hysteresis.
+func (c *controller) stepSimple(p50, p99 time.Duration, n, above uint64) {
+	v := float64(p50)
+
+	if !c.ready {
+		c.fast, c.slow, c.ready = v, v, true
+		return
+	}
+
+	// One signal, one baseline. The fast EWMA is intentionally gone: the tick
+	// counters below already reject a single noisy sample, and using the raw
+	// median avoids the post-stall over-backoff caused by a lagging filter.
+	c.fast = v
+	if v < c.slow {
+		c.slow += c.slowDownAlpha * (v - c.slow)
+	} else {
+		delta := c.slowUpAlpha * (v - c.slow)
+		if maxRise := c.slow * c.cfg.MaxBaselineRise; delta > maxRise {
+			delta = maxRise
+		}
+		c.slow += delta
+	}
+
+	high, low := c.window()
+	factor := 1.0
+
+	switch {
+	case v >= high:
+		c.above++
+		c.below = 0
+		if c.above >= c.cfg.BackoffTicks {
+			factor = 1 - c.cfg.DownStep
+			c.above = 0
+			c.coldStart = false
+		}
+	case v <= low:
+		c.below++
+		c.above = 0
+		if c.below >= c.cfg.RecoverTicks {
+			if c.rampUp() {
+				factor = c.cfg.SlowStartGain
+			} else {
+				factor = 1 + c.cfg.UpStep
+			}
+			c.below = 0
+		}
+	default:
+		c.above, c.below = 0, 0
+	}
+
+	// One tail rule: either a plain exceedance ratio or the p99 quantile.
+	// TailFactor is still useful for heterogeneous endpoints; the ratio mode
+	// keeps the caller's tolerance but drops the binomial margin.
+	if tol := c.cfg.TailTolerance; tol > 0 {
+		c.over += c.overAlpha * (float64(above)/float64(n) - c.over)
+		c.tailThreshold = tol
+	}
+	if tail := c.tailTarget(); tail > 0 {
+		switch {
+		case c.cfg.TailTolerance > 0:
+			if c.over > c.cfg.TailTolerance && float64(above) > c.cfg.TailTolerance*float64(n) {
+				if floor := 1 - c.cfg.DownStep; factor > floor {
+					factor = floor
+				}
+				c.coldStart = false
+			}
+		case p99 > tail:
+			if floor := 1 - c.cfg.DownStep; factor > floor {
+				factor = floor
+			}
+			c.coldStart = false
+		}
+	}
+
+	c.rate = clampRate(c.rate*factor, c.cfg.MinRate, c.cfg.MaxRate)
+	if c.rate >= float64(c.cfg.MaxRate) {
+		c.coldStart = false
 	}
 	c.setRate(int(math.Round(c.rate)))
 }

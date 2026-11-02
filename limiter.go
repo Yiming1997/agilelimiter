@@ -68,6 +68,13 @@ type Config struct {
 	// wins over the preset; see applyPreset for the exact table.
 	Preset Preset
 
+	// Simple selects the experimental simplified control law: one raw p50
+	// signal, fixed-step AIMD, and a single tail guard. It deliberately
+	// ignores the fast EWMA and the proportional Gain; TailTolerance becomes a
+	// plain observed ratio without the binomial margin. The default (false)
+	// keeps the advanced controller unchanged.
+	Simple bool
+
 	// MinRate and MaxRate bound the dynamic rate, in requests per second.
 	// MaxRate is the *hard ceiling* you are willing to promise — the one number
 	// the caller must supply. MinRate is the outage probe rate: the rate the
@@ -644,6 +651,7 @@ type Resolved struct {
 	// For the latter the three *Rate fields below hold the concurrency bounds.
 	Kind   string
 	Preset string
+	Simple bool
 
 	MaxRate     int
 	MinRate     int
@@ -694,6 +702,7 @@ func resolve(cfg Config, kind string) Resolved {
 	r := Resolved{
 		Kind:             kind,
 		Preset:           cfg.Preset.String(),
+		Simple:           cfg.Simple,
 		MaxRate:          cfg.MaxRate,
 		MinRate:          cfg.MinRate,
 		InitialRate:      cfg.InitialRate,

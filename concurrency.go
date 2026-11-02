@@ -18,6 +18,8 @@ var ErrOverloaded = errors.New("agilelimiter: concurrency limit reached")
 type ConcurrencyConfig struct {
 	// Preset fills the policy fields you leave at zero (see Config.Preset).
 	Preset Preset
+	// Simple selects the simplified control law (see Config.Simple).
+	Simple bool
 
 	// MinLimit and MaxLimit bound the dynamic concurrency limit, in requests.
 	// MaxLimit is the *hard ceiling* you are willing to promise the service.
@@ -122,6 +124,7 @@ type ConcurrencyLimiter struct {
 func (cc ConcurrencyConfig) toConfig() Config {
 	return Config{
 		Preset:           cc.Preset,
+		Simple:           cc.Simple,
 		MinRate:          cc.MinLimit,
 		MaxRate:          cc.MaxLimit,
 		InitialRate:      cc.InitialLimit,

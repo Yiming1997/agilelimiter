@@ -40,7 +40,6 @@ func runVerdictArm(rt http.RoundTripper, observeAll bool, run time.Duration) (ra
 		MaxRate:          500,
 		InitialRate:      100,
 		SLOTarget:        300 * time.Millisecond,
-		FastHalfLife:     250 * time.Millisecond,
 		SlowHalfLife:     2 * time.Second,
 		SlowDownHalfLife: 500 * time.Millisecond,
 		UpStep:           0.10, // 1.1^10 per second, so the trend is visible in 2s

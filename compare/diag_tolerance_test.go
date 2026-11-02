@@ -26,7 +26,6 @@ func TestDiagTailToleranceTrace(t *testing.T) {
 			InitialRate:   pollInit,
 			SLOTarget:     pollSLO,
 			TailTolerance: tol,
-			FastHalfLife:  750 * time.Millisecond,
 			SlowHalfLife:  45 * time.Second,
 			Tick:          250 * time.Millisecond,
 		})

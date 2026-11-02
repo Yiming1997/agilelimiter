@@ -133,7 +133,6 @@ func agileColdArm(sc inboundScenario, initial int) func() inboundLimiter {
 			MaxLimit:        500,
 			InitialLimit:    initial,
 			SLOTarget:       sc.slo,
-			FastHalfLife:    750 * time.Millisecond,
 			SlowHalfLife:    10 * time.Second,
 			DownStep:        0.30,
 			UpStep:          0.05,

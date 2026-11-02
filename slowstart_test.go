@@ -18,7 +18,6 @@ func slowStartLimiter(t *testing.T, gain float64) *Limiter {
 		DownStep:        0.30,
 		SlowStartGain:   gain,
 		Tick:            time.Second,
-		FastHalfLife:    time.Second,
 		SlowHalfLife:    time.Minute,
 		TargetInflation: 1.0,
 	})
@@ -61,7 +60,7 @@ func TestSlowStartIsOverAfterTheFirstBackoff(t *testing.T) {
 		t.Fatalf("rate %v did not fall on congestion (was %v)", got, before)
 	}
 
-	// Let the fast EWMA forget the slow sample, then look at the first probe up.
+	// The baseline needs a few healthy ticks, then look at the first probe up.
 	prev := l.Rate()
 	for i := 0; i < 40; i++ {
 		feed(l, 10*time.Millisecond, 100)
@@ -94,7 +93,7 @@ func TestSlowStartGainOneIsPureAIMD(t *testing.T) {
 func TestColdStartEndsAtMaxRate(t *testing.T) {
 	l := New(Config{
 		MinRate: 10, MaxRate: 200, InitialRate: 100,
-		Tick: time.Second, FastHalfLife: time.Second, SlowHalfLife: time.Minute,
+		Tick: time.Second, SlowHalfLife: time.Minute,
 		TargetInflation: 1.0,
 	})
 	feed(l, 10*time.Millisecond, 100)

@@ -6,7 +6,6 @@ import (
 )
 
 func newSimpleLimiter(cfg Config) *Limiter {
-	cfg.Simple = true
 	if cfg.Tick <= 0 {
 		cfg.Tick = time.Second
 	}
@@ -118,15 +117,14 @@ func TestSimpleControllerColdStartEndsOnBackoff(t *testing.T) {
 	}
 }
 
-func TestSimpleModeReachesConcurrencyLimiter(t *testing.T) {
+func TestConcurrencyUsesController(t *testing.T) {
 	l := NewConcurrency(ConcurrencyConfig{
-		Simple:       true,
 		MinLimit:     2,
 		MaxLimit:     100,
 		InitialLimit: 10,
 	})
 	defer l.Stop()
-	if !l.Config().Simple {
-		t.Fatal("ConcurrencyConfig.Simple was not propagated")
+	if got := l.Config().Kind; got != "concurrency" {
+		t.Fatalf("Kind = %q, want concurrency", got)
 	}
 }

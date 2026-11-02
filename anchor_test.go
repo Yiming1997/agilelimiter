@@ -98,16 +98,13 @@ func TestBackoffTicksNeedAgreement(t *testing.T) {
 
 // A tick inside the band breaks the run: agreement must be consecutive.
 //
-// FastHalfLife is one tick, so the fast signal is exactly this tick's p50. With
-// the 3s default an alternating signal never returns to the band on its own —
-// the EWMA needs several ticks to decay — and the test would measure the
-// smoothing rather than the counter.
+// The controller uses this tick's p50 directly, so an alternating signal does
+// not need several ticks of EWMA decay before it can return to the band.
 func TestHysteresisRequiresConsecutiveTicks(t *testing.T) {
 	l := New(Config{
 		MinRate:      10,
 		MaxRate:      500,
 		InitialRate:  300,
-		FastHalfLife: time.Millisecond,
 		BackoffTicks: 2,
 		RecoverTicks: 2,
 	})
@@ -131,7 +128,6 @@ func TestRecoverTicksNeedAgreement(t *testing.T) {
 		MinRate:      10,
 		MaxRate:      500,
 		InitialRate:  300,
-		FastHalfLife: time.Millisecond, // see TestHysteresisRequiresConsecutiveTicks
 		BackoffTicks: 1,
 		RecoverTicks: 3,
 	})

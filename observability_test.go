@@ -48,7 +48,6 @@ func TestStartIsIdempotent(t *testing.T) {
 		UpStep:        0.5, // 1.5x per tick makes N loops obvious after a few ticks
 		SlowStartGain: 1,   // this test is about loop count, not about cold start
 		Tick:          20 * time.Millisecond,
-		FastHalfLife:  10 * time.Millisecond,
 		SlowHalfLife:  10 * time.Millisecond,
 		SLOTarget:     time.Second,
 	})
@@ -77,7 +76,6 @@ func TestConcurrencyStartIsIdempotent(t *testing.T) {
 		UpStep:           0.5,
 		SlowStartGain:    1, // this test is about loop count, not about cold start
 		Tick:             20 * time.Millisecond,
-		FastHalfLife:     10 * time.Millisecond,
 		SlowHalfLife:     10 * time.Millisecond,
 		SlowDownHalfLife: 10 * time.Millisecond,
 		SLOTarget:        time.Second,

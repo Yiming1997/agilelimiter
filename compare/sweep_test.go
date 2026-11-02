@@ -26,7 +26,7 @@
 //   - The adaptive arms are warm-started at InitialRate/InitialLimit = 100,
 //     which is neither the true capacity nor the optimum: a neutral start.
 //   - The adaptive control loop is deliberately gentle (Tick 250ms, UpStep 5%,
-//     FastHalfLife 750ms) — near the library defaults. The first version of
+//     SlowHalfLife 45s) — near the library defaults. The first version of
 //     this sweep used 10% per 100ms and the loop simply went unstable, which
 //     measures the tuning, not the algorithm.
 //   - "good%" counts requests whose *service* time met the SLO. Queue time spent
@@ -177,7 +177,9 @@ func (u *uberInbound) observe(time.Duration) {}
 func (u *uberInbound) final() int            { return u.rate }
 func (u *uberInbound) stop()                 {}
 
-type agileInbound struct{ l *agilelimiter.ConcurrencyLimiter }
+type agileInbound struct {
+	l *agilelimiter.ConcurrencyLimiter
+}
 
 func (a *agileInbound) acquire() bool           { return a.l.TryTake() }
 func (a *agileInbound) release()                { a.l.Release() }
@@ -275,7 +277,6 @@ func agileInArm(sc inboundScenario) func() inboundLimiter {
 			MaxLimit:        500,
 			InitialLimit:    warmStartIn,
 			SLOTarget:       sc.slo,
-			FastHalfLife:    750 * time.Millisecond,
 			SlowHalfLife:    10 * time.Second,
 			DownStep:        0.30,
 			UpStep:          0.05,
@@ -444,13 +445,11 @@ func agileOutArm(slo time.Duration) func() outboundLimiter {
 			MaxRate:          2000,
 			InitialRate:      warmStartOut,
 			SLOTarget:        slo,
-			FastHalfLife:     750 * time.Millisecond,
 			SlowHalfLife:     10 * time.Second,
 			SlowDownHalfLife: time.Second,
 			TargetInflation:  2.5,
 			UpStep:           0.05,
 			DownStep:         0.30,
-			Gain:             1.0,
 			Deadband:         0.08,
 			Tick:             250 * time.Millisecond,
 		})

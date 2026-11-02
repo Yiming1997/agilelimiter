@@ -18,8 +18,6 @@ var ErrOverloaded = errors.New("agilelimiter: concurrency limit reached")
 type ConcurrencyConfig struct {
 	// Preset fills the policy fields you leave at zero (see Config.Preset).
 	Preset Preset
-	// Simple selects the simplified control law (see Config.Simple).
-	Simple bool
 
 	// MinLimit and MaxLimit bound the dynamic concurrency limit, in requests.
 	// MaxLimit is the *hard ceiling* you are willing to promise the service.
@@ -49,8 +47,8 @@ type ConcurrencyConfig struct {
 	BackoffTicks int
 	RecoverTicks int
 
-	// EWMA half-lives for the control signal.
-	FastHalfLife     time.Duration // recent latency
+	// SlowHalfLife is the healthy-baseline EWMA half-life. SlowDownHalfLife
+	// controls how quickly it follows improvements down.
 	SlowHalfLife     time.Duration // healthy baseline (creeps up slowly)
 	SlowDownHalfLife time.Duration // baseline follows improvements down
 
@@ -65,8 +63,6 @@ type ConcurrencyConfig struct {
 	// signal may rise before the controller backs off. 1.0 means "accept up to
 	// 2x the baseline".
 	TargetInflation float64
-	// Gain scales the proportional backoff, capped at DownStep. E.g. 1.0.
-	Gain float64
 	// UpStep / DownStep cap the fractional change per tick (down faster than up).
 	UpStep   float64
 	DownStep float64
@@ -97,7 +93,7 @@ type ConcurrencyConfig struct {
 // *inbound* side of a service: it caps how many requests are handled at once and
 // admits or refuses each one non-blockingly.
 //
-// It shares its brain with Limiter — the same fast/slow EWMA baseline, target
+// It shares its brain with Limiter — the same p50 signal, slow baseline, target
 // window and p99 guard — and swaps only the actuator, from a leaky bucket to a
 // semaphore. The signal is the handler's own handling time; the target is a
 // concurrency count instead of a rate.
@@ -124,7 +120,6 @@ type ConcurrencyLimiter struct {
 func (cc ConcurrencyConfig) toConfig() Config {
 	return Config{
 		Preset:           cc.Preset,
-		Simple:           cc.Simple,
 		MinRate:          cc.MinLimit,
 		MaxRate:          cc.MaxLimit,
 		InitialRate:      cc.InitialLimit,
@@ -134,13 +129,11 @@ func (cc ConcurrencyConfig) toConfig() Config {
 		Anchor:           cc.Anchor,
 		BackoffTicks:     cc.BackoffTicks,
 		RecoverTicks:     cc.RecoverTicks,
-		FastHalfLife:     cc.FastHalfLife,
 		SlowHalfLife:     cc.SlowHalfLife,
 		SlowDownHalfLife: cc.SlowDownHalfLife,
 		MaxBaselineRise:  cc.MaxBaselineRise,
 		Tick:             cc.Tick,
 		TargetInflation:  cc.TargetInflation,
-		Gain:             cc.Gain,
 		UpStep:           cc.UpStep,
 		DownStep:         cc.DownStep,
 		SlowStartGain:    cc.SlowStartGain,

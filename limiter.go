@@ -68,13 +68,6 @@ type Config struct {
 	// wins over the preset; see applyPreset for the exact table.
 	Preset Preset
 
-	// Simple selects the experimental simplified control law: one raw p50
-	// signal, fixed-step AIMD, and a single tail guard. It deliberately
-	// ignores the fast EWMA and the proportional Gain; TailTolerance becomes a
-	// plain observed ratio without the binomial margin. The default (false)
-	// keeps the advanced controller unchanged.
-	Simple bool
-
 	// MinRate and MaxRate bound the dynamic rate, in requests per second.
 	// MaxRate is the *hard ceiling* you are willing to promise — the one number
 	// the caller must supply. MinRate is the outage probe rate: the rate the
@@ -163,8 +156,8 @@ type Config struct {
 
 	// ---- the scale of the control law: moving these re-tunes every gain ----
 
-	// EWMA half-lives for the control signal.
-	FastHalfLife     time.Duration // recent latency
+	// SlowHalfLife is the healthy-baseline EWMA half-life. SlowDownHalfLife
+	// controls how quickly it follows improvements down.
 	SlowHalfLife     time.Duration // healthy baseline (creeps up slowly)
 	SlowDownHalfLife time.Duration // baseline follows improvements down
 
@@ -181,13 +174,10 @@ type Config struct {
 	Tick time.Duration
 
 	// TargetInflation is how far above the healthy baseline latency the
-	// controller lets the fast signal rise before it backs off. 1.0 means "accept
-	// up to 2x the baseline". Setting it too low makes the limiter back off at
-	// the first sign of queuing and run at very low utilization.
+	// controller lets this tick's p50 rise before it backs off. 1.0 means
+	// "accept up to 2x the baseline". Setting it too low makes the limiter back
+	// off at the first sign of queuing and run at very low utilization.
 	TargetInflation float64
-	// Gain scales the proportional backoff: factor = 1 - Gain*(excess/high),
-	// capped at DownStep. E.g. 1.0.
-	Gain float64
 	// UpStep / DownStep cap the fractional change per tick (asymmetry: down
 	// faster than up). E.g. 0.05 up, 0.30 down.
 	UpStep   float64
@@ -360,9 +350,6 @@ func withDefaults(c Config) Config {
 	if c.InitialRate > c.MaxRate {
 		c.InitialRate = c.MaxRate
 	}
-	if c.FastHalfLife <= 0 {
-		c.FastHalfLife = 3 * time.Second
-	}
 	if c.SlowHalfLife <= 0 {
 		c.SlowHalfLife = 45 * time.Second
 	}
@@ -380,9 +367,6 @@ func withDefaults(c Config) Config {
 	}
 	if c.TargetInflation <= 0 {
 		c.TargetInflation = 1.0
-	}
-	if c.Gain <= 0 {
-		c.Gain = 1.0
 	}
 	if c.UpStep <= 0 {
 		c.UpStep = 0.05
@@ -569,7 +553,7 @@ func (l *Limiter) Rate() float64 { return l.ctrl.currentRate() }
 type Stats struct {
 	Rate     float64       // current target rate, requests per second
 	Baseline time.Duration // slow EWMA playing the role of the healthy baseline
-	Fast     time.Duration // fast EWMA of the recent median latency
+	Fast     time.Duration // this tick's p50, for observability
 
 	// What the last completed tick observed. Samples is the number of
 	// observations that tick saw; P50 and P99 are that tick's quantiles, and are
@@ -591,13 +575,10 @@ type Stats struct {
 	// Export it: a non-zero TailRatio with a rate that is not moving tells you the
 	// guard is at its threshold and the population, not the load, is deciding.
 	TailRatio float64
-	// TailThreshold is what TailRatio is compared against: TailTolerance plus
-	// tailSigma standard errors, recomputed every tick from the sample count. It
-	// is zero in quantile mode.
+	// TailThreshold is what TailRatio is compared against: the configured
+	// TailTolerance. It is zero in quantile mode.
 	//
-	// Export it because it turns "why did the guard not fire?" into arithmetic: a
-	// low-traffic service has a small n, therefore a wide margin, therefore a
-	// threshold far above its tolerance.
+	// Export it because it turns "why did the guard not fire?" into arithmetic.
 	TailThreshold float64
 
 	// ColdStart is true until the controller has had to back off once (or has
@@ -651,7 +632,6 @@ type Resolved struct {
 	// For the latter the three *Rate fields below hold the concurrency bounds.
 	Kind   string
 	Preset string
-	Simple bool
 
 	MaxRate     int
 	MinRate     int
@@ -675,13 +655,11 @@ type Resolved struct {
 	TailTolerance float64
 
 	Tick             time.Duration
-	FastHalfLife     time.Duration
 	SlowHalfLife     time.Duration
 	SlowDownHalfLife time.Duration
 	MaxBaselineRise  float64
 
 	TargetInflation float64
-	Gain            float64
 	UpStep          float64
 	DownStep        float64
 	SlowStartGain   float64
@@ -702,7 +680,6 @@ func resolve(cfg Config, kind string) Resolved {
 	r := Resolved{
 		Kind:             kind,
 		Preset:           cfg.Preset.String(),
-		Simple:           cfg.Simple,
 		MaxRate:          cfg.MaxRate,
 		MinRate:          cfg.MinRate,
 		InitialRate:      cfg.InitialRate,
@@ -710,12 +687,10 @@ func resolve(cfg Config, kind string) Resolved {
 		TailFactor:       cfg.TailFactor,
 		TailTolerance:    cfg.TailTolerance,
 		Tick:             cfg.Tick,
-		FastHalfLife:     cfg.FastHalfLife,
 		SlowHalfLife:     cfg.SlowHalfLife,
 		SlowDownHalfLife: cfg.SlowDownHalfLife,
 		MaxBaselineRise:  cfg.MaxBaselineRise,
 		TargetInflation:  cfg.TargetInflation,
-		Gain:             cfg.Gain,
 		UpStep:           cfg.UpStep,
 		DownStep:         cfg.DownStep,
 		SlowStartGain:    cfg.SlowStartGain,
@@ -746,8 +721,8 @@ func resolve(cfg Config, kind string) Resolved {
 	} else {
 		target := time.Duration(float64(cfg.SLOTarget) * cfg.TailFactor)
 		if cfg.TailTolerance > 0 {
-			r.Tail = fmt.Sprintf("%.0f%%+%.0fσ of requests above %s (%.1fx SLOTarget)",
-				cfg.TailTolerance*100, tailSigma, target, cfg.TailFactor)
+			r.Tail = fmt.Sprintf("%.0f%% of requests above %s (%.1fx SLOTarget)",
+				cfg.TailTolerance*100, target, cfg.TailFactor)
 		} else {
 			r.Tail = fmt.Sprintf("p99 > %s (%.1fx SLOTarget)", target, cfg.TailFactor)
 		}
@@ -799,9 +774,6 @@ func (c Config) Validate() error {
 	if c.TargetInflation < 0 {
 		add("TargetInflation %.3f must not be negative", c.TargetInflation)
 	}
-	if c.Gain < 0 {
-		add("Gain %.3f must not be negative", c.Gain)
-	}
 	if c.UpStep < 0 || c.DownStep < 0 {
 		add("UpStep and DownStep must not be negative")
 	}
@@ -823,9 +795,6 @@ func (c Config) Validate() error {
 	// A half-life shorter than a few ticks degenerates the filter into a
 	// pass-through (alpha -> 1) and the setting stops meaning anything.
 	if c.Tick > 0 {
-		if c.FastHalfLife > 0 && c.FastHalfLife < 3*c.Tick {
-			add("FastHalfLife %s is under 3x Tick (%s): the filter stops smoothing", c.FastHalfLife, c.Tick)
-		}
 		if c.SlowHalfLife > 0 && c.SlowHalfLife < 3*c.Tick {
 			add("SlowHalfLife %s is under 3x Tick (%s): the baseline stops being a baseline", c.SlowHalfLife, c.Tick)
 		}

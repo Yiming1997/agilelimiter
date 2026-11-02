@@ -129,7 +129,6 @@ func newAgile() (limiter, func()) {
 		MaxRate:         500,
 		InitialRate:     40,                     // cold-start low, let the controller ramp up
 		SLOTarget:       100 * time.Millisecond, // == the SLO we are scored against; the tail guard protects it directly
-		FastHalfLife:    750 * time.Millisecond, // responsive to recent latency
 		SlowHalfLife:    45 * time.Second,       // healthy baseline (the library default: long and stable)
 		TargetInflation: 2.5,                    // tolerate latency up to 3.5x baseline (~70ms), comfortably under the SLO
 		Tick:            250 * time.Millisecond, // UpStep/Tick governs how fast it probes; keep it gentle

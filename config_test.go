@@ -18,7 +18,7 @@ func TestPresetNoneChangesNothing(t *testing.T) {
 	if none != balanced {
 		t.Fatalf("PresetBalanced must equal PresetNone:\n none:     %+v\n balanced: %+v", none, balanced)
 	}
-	if none.Tick != time.Second || none.FastHalfLife != 3*time.Second ||
+	if none.Tick != time.Second ||
 		none.SlowHalfLife != 45*time.Second || none.Anchor != "baseline" ||
 		none.BackoffTicks != 1 || none.RecoverTicks != 1 {
 		t.Fatalf("shipped defaults changed: %+v", none)
@@ -109,7 +109,6 @@ func TestValidate(t *testing.T) {
 		{"deadband of one", Config{MaxRate: 120, Deadband: 1}, "Deadband"},
 		{"downstep over one", Config{MaxRate: 120, DownStep: 1.2}, "DownStep"},
 		{"tick too long", Config{MaxRate: 120, Tick: 30 * time.Second}, "Tick"},
-		{"half life under tick", Config{MaxRate: 120, Tick: time.Second, FastHalfLife: time.Second}, "FastHalfLife"},
 		{"negative slow start", Config{MaxRate: 120, SlowStartGain: 0.5}, "SlowStartGain"},
 	}
 
@@ -200,7 +199,7 @@ func TestResolvedDescribesTheGuard(t *testing.T) {
 		TailFactor:    2,
 		TailTolerance: 0.1,
 	}).Config()
-	if ratio.Tail != "10%+3σ of requests above 200ms (2.0x SLOTarget)" {
+	if ratio.Tail != "10% of requests above 200ms (2.0x SLOTarget)" {
 		t.Fatalf("Tail = %q", ratio.Tail)
 	}
 

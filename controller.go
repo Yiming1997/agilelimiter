@@ -7,64 +7,52 @@ import (
 )
 
 // sloWindowFraction is how much of the SLO the controller is willing to aim at.
-// Some headroom below the SLO is needed because the fast EWMA lags the true
-// latency: aiming exactly at the SLO means overshooting it on every probe.
+// Aiming at the SLO itself means ordinary jitter pushes half the requests over it.
 const sloWindowFraction = 0.8
 
 // controller turns the latency signal into a target rate.
 //
-// It compares a *fast* EWMA of the recent median latency against a *slow* EWMA
-// that plays the role of a healthy baseline, and tolerates the latency rising
-// to (1 + TargetInflation) x baseline before backing off. Operating with some
-// queuing — rather than backing off at the first sign of it — is what keeps
-// utilization reasonable.
+// The simplified law is intentionally small:
 //
-//	fast ~ baseline                -> healthy, probe up (additive increase)
-//	fast well above the tolerance  -> congested, back off (proportional)
-//	in between                     -> hold (deadband)
+//	baseline <- one asymmetric, rise-capped EWMA of p50
+//	p50 above the window  -> back off by a fixed step
+//	p50 below the window  -> probe up, doubling until the first backoff
+//	p99 above the tail    -> back off, using either a plain ratio or p99
 //
-// The baseline is updated asymmetrically: it falls quickly when latency improves
-// (fast recovery) but rises only slowly, so a sustained overload cannot drag the
-// baseline up to the congested value and freeze the controller. This is the
-// single most important safeguard — see the README "Pitfalls" section.
+// The baseline falls quickly when latency improves and rises only slowly, so a
+// sustained overload cannot drag the tolerance up with it.
 type controller struct {
 	mu sync.Mutex
 
 	cfg     Config
 	hist    *histogram
 	setRate func(rate int)
-	simple  bool
 
-	fast  float64 // fast EWMA of p50, nanoseconds
+	fast  float64 // this tick's p50, nanoseconds (Stats only)
 	slow  float64 // slow EWMA baseline of p50, nanoseconds
 	rate  float64 // current target rate, requests per second
 	ready bool
 
-	// coldStart is true until the controller has evidence of congestion, i.e. it
-	// knows where the knee is. While it is true a healthy tick multiplies the
-	// rate (SlowStartGain) instead of adding UpStep, so an unknown capacity is
-	// found in log2 ticks rather than in ln/ln(1+UpStep) ticks. See the
-	// SlowStartGain field for why the asymmetry justifies this.
+	// coldStart is true until the controller has seen congestion. While it is
+	// true a healthy tick multiplies the rate instead of adding UpStep.
 	coldStart bool
 
-	// above/below count how many consecutive ticks the fast signal has spent on
-	// each side of the tolerated band, for the BackoffTicks/RecoverTicks
-	// hysteresis. A tick inside the band resets both.
+	// above/below count consecutive ticks on each side of the band. A tick in
+	// the band resets both; an action resets the counter that produced it.
 	above, below int
 
-	// over is the smoothed fraction of samples above the tail target, and
-	// overAlpha is its EWMA factor. They only exist in ratio mode.
+	// over is the smoothed fraction of samples above the tail target. It only
+	// exists when TailTolerance > 0.
 	over      float64
 	overAlpha float64
-	// tailThreshold is the effective firing threshold: the caller's tolerance plus
-	// tailSigma standard errors, recomputed each tick from the sample count.
+
+	// tailThreshold is the caller's TailTolerance. The simplified law uses the
+	// plain observed ratio, without a binomial margin.
 	tailThreshold float64
 
-	// what the last completed tick saw, for Stats
 	lastP50, lastP99 time.Duration
 	lastSamples      uint64
 
-	fastAlpha     float64
 	slowUpAlpha   float64
 	slowDownAlpha float64
 }
@@ -74,14 +62,12 @@ func newController(cfg Config, hist *histogram, setRate func(rate int)) *control
 		cfg:           cfg,
 		hist:          hist,
 		setRate:       setRate,
-		simple:        cfg.Simple,
 		rate:          float64(cfg.InitialRate),
 		coldStart:     true,
-		fastAlpha:     ewmaAlpha(cfg.FastHalfLife, cfg.Tick),
 		slowUpAlpha:   ewmaAlpha(cfg.SlowHalfLife, cfg.Tick),
 		slowDownAlpha: ewmaAlpha(cfg.SlowDownHalfLife, cfg.Tick),
-		// Two ticks: short enough to react to a sudden blowout, long enough that
-		// one slow sample in a quiet tick decays instead of repeating.
+		// Two ticks: short enough to react to a blowout, long enough that one
+		// slow sample in a quiet tick decays instead of repeating.
 		overAlpha: ewmaAlpha(2*cfg.Tick, cfg.Tick),
 	}
 }
@@ -101,173 +87,22 @@ func (c *controller) step() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if c.simple {
-		p50, p99, n, above := c.hist.snapshotAbove(c.snapshotTail())
-		c.lastP50, c.lastP99, c.lastSamples = p50, p99, n
-		if n == 0 {
-			return
-		}
-		c.stepSimple(p50, p99, n, above)
-		return
-	}
-
 	p50, p99, n, above := c.hist.snapshotAbove(c.snapshotTail())
-	// Retain what this tick saw for Stats. With no samples both quantiles are
-	// zero and Samples is zero, which is how a caller can tell "the controller
-	// held its rate" apart from "the controller was blind".
 	c.lastP50, c.lastP99, c.lastSamples = p50, p99, n
 	if n == 0 {
 		return
 	}
 	v := float64(p50)
 
-	// First real sample seeds both filters (no adjustment yet).
+	// First real sample seeds the baseline; no adjustment yet.
 	if !c.ready {
 		c.fast, c.slow, c.ready = v, v, true
 		return
 	}
 
-	c.fast += c.fastAlpha * (v - c.fast)
-	if v < c.slow {
-		c.slow += c.slowDownAlpha * (v - c.slow) // improving: follow down quickly
-	} else {
-		// Degrading. A slower alpha alone is not enough: under sustained
-		// congestion the baseline still creeps up toward the congested value,
-		// which drags `high` up with it and lets the controller declare a
-		// congested service healthy — congestion would be widening its own
-		// tolerance. Measured: baseline drifted +43% in 10s with a 5s half-life,
-		// and with the 45s default it is worse. So the upward drift is hard
-		// capped per tick, which keeps the target anchored through an overload
-		// while still permitting a genuine, permanent slowdown to be absorbed
-		// over minutes.
-		delta := c.slowUpAlpha * (v - c.slow)
-		if maxRise := c.slow * c.cfg.MaxBaselineRise; delta > maxRise {
-			delta = maxRise
-		}
-		c.slow += delta
-	}
-
-	// The acceptable latency band for this tick. Which anchor it is measured
-	// against — and therefore how much of the SLO's headroom it leaves — is the
-	// one thing Anchor changes.
-	high, low := c.window()
-
-	// A step needs BackoffTicks/RecoverTicks consecutive ticks on the same side
-	// of the band: one tick of jitter then costs nothing. This matters more than
-	// the size of the steps, because the steps are asymmetric (-30% vs +5%), so
-	// an alternating signal does not cancel out — it ratchets the rate down.
-	var factor float64 = 1
-	switch {
-	case c.fast <= low:
-		c.below++
-		c.above = 0
-		if c.below < c.cfg.RecoverTicks {
-			break // not yet enough agreement to spend a probe
-		}
-		// Healthy: probe up. Additively, unless we have never seen congestion — then
-		// we do not know where the knee is and doubling finds it in log2 ticks.
-		// Overshooting on the way up is cheap (DownStep is 0.30, so two ticks bring
-		// us back); undershooting is not (UpStep is 0.05).
-		if c.rampUp() {
-			factor = c.cfg.SlowStartGain
-		} else {
-			factor = 1 + c.cfg.UpStep
-		}
-	// A backoff needs *both* the filtered signal and this tick's median above the
-	// window. `fast` is a memory — three seconds by default — so on the way down it
-	// keeps reporting congestion long after the latency is gone: measured on a
-	// downstream that is healthy before and after a one-second stall, the rate fell
-	// 300 -> 72 during the stall and then 72 -> 5 afterwards, because fourteen
-	// consecutive -30% ticks fired while every request was answering in 24ms. A
-	// filtered signal is the right thing to *trust*; it is the wrong thing to keep
-	// *acting on* once the live median has recovered.
-	case c.fast >= high && v >= high:
-		c.above++
-		c.below = 0
-		if c.above < c.cfg.BackoffTicks {
-			break // not yet enough agreement to spend a step
-		}
-		over := (c.fast - high) / high
-		factor = 1 - math.Min(c.cfg.DownStep, c.cfg.Gain*over)
-		c.coldStart = false // we found the knee; ordinary AIMD from here on
-	default:
-		c.above, c.below = 0, 0 // within the band: hold
-	}
-
-	// Tail guard: if the worst-case latency blows past the tail target, force a
-	// backoff step regardless of the median-based decision.
-	//
-	// Two modes, and the difference matters. With TailTolerance == 0 the test is
-	// "is the 99th percentile above the target", which at low sample counts is
-	// literally "was the slowest request of this tick above it" and which cannot
-	// tell a heterogeneous population from queueing. With a tolerance the test is
-	// "what fraction of this tick was above the target, smoothed", so 5% of
-	// requests that are simply a different endpoint no longer read as congestion,
-	// while a real blowout (most of the tick over the line) still does.
-	//
-	// The tail guard deliberately skips the BackoffTicks hysteresis: a tail that
-	// blows through the target is a safety valve, and delaying it is not worth the
-	// noise it would filter.
-	if tail := c.tailTarget(); tail > 0 {
-		switch {
-		case c.cfg.TailTolerance > 0:
-			c.over += c.overAlpha * (float64(above)/float64(n) - c.over)
-
-			// The tolerance is the caller's policy; the margin is the controller's
-			// evidence. A per-tick exceedance ratio is a binomial proportion, so its
-			// standard error is sqrt(p(1-p)/n) — which is why the same tolerance
-			// needs a wider margin on a low-traffic service than on a busy one. The
-			// EWMA averages about 1/varianceFactor ticks, so sigma is scaled by
-			// sqrt(alpha/(2-alpha)) to describe the smoothed estimate.
-			tol := c.cfg.TailTolerance
-			sigma := math.Sqrt(tol*(1-tol)/float64(n)) * math.Sqrt(c.overAlpha/(2-c.overAlpha))
-			c.tailThreshold = tol + tailSigma*sigma
-
-			if c.over > c.tailThreshold && float64(above) > tol*float64(n) {
-				// Both halves are needed for the same reason the median law needs
-				// them: `over` is a memory, and acting on it alone keeps cutting for
-				// about six ticks after the tail has already recovered — measured,
-				// that cost two thirds of the rate a second after a one-second stall
-				// ended (22 req/s recovered against 68 with the guard muted).
-				excess := (c.over - tol) / tol
-				if floor := 1 - math.Min(c.cfg.DownStep, c.cfg.Gain*excess); factor > floor {
-					factor = floor
-				}
-				c.coldStart = false
-			}
-		case p99 > tail:
-			if floor := 1 - c.cfg.DownStep; factor > floor {
-				factor = floor
-			}
-			c.coldStart = false // the tail is congestion evidence too
-		}
-	}
-
-	c.rate = clampRate(c.rate*factor, c.cfg.MinRate, c.cfg.MaxRate)
-	if c.rate >= float64(c.cfg.MaxRate) {
-		c.coldStart = false // nothing left to discover up there
-	}
-	c.setRate(int(math.Round(c.rate)))
-}
-
-// stepSimple is the approximate control law selected by Config.Simple.
-//
-// Compared with step it removes the fast EWMA, the proportional Gain, and the
-// binomial margin on the tail ratio. It keeps the two things that are hard to
-// replace: the asymmetric, rise-capped baseline and the cold-start ramp. The
-// median test uses this tick's p50 directly, with the existing tick counters as
-// hysteresis.
-func (c *controller) stepSimple(p50, p99 time.Duration, n, above uint64) {
-	v := float64(p50)
-
-	if !c.ready {
-		c.fast, c.slow, c.ready = v, v, true
-		return
-	}
-
-	// One signal, one baseline. The fast EWMA is intentionally gone: the tick
-	// counters below already reject a single noisy sample, and using the raw
-	// median avoids the post-stall over-backoff caused by a lagging filter.
+	// One signal, one baseline. The raw median is used directly: the tick
+	// counters below reject a single noisy sample, and there is no lagging
+	// filter to keep reporting congestion after the stall has ended.
 	c.fast = v
 	if v < c.slow {
 		c.slow += c.slowDownAlpha * (v - c.slow)
@@ -306,9 +141,9 @@ func (c *controller) stepSimple(p50, p99 time.Duration, n, above uint64) {
 		c.above, c.below = 0, 0
 	}
 
-	// One tail rule: either a plain exceedance ratio or the p99 quantile.
-	// TailFactor is still useful for heterogeneous endpoints; the ratio mode
-	// keeps the caller's tolerance but drops the binomial margin.
+	// One tail rule: a plain exceedance ratio or the p99 quantile. TailFactor
+	// is still useful for heterogeneous endpoints; there is no statistical
+	// margin in this law.
 	if tol := c.cfg.TailTolerance; tol > 0 {
 		c.over += c.overAlpha * (float64(above)/float64(n) - c.over)
 		c.tailThreshold = tol
@@ -332,38 +167,19 @@ func (c *controller) stepSimple(p50, p99 time.Duration, n, above uint64) {
 
 	c.rate = clampRate(c.rate*factor, c.cfg.MinRate, c.cfg.MaxRate)
 	if c.rate >= float64(c.cfg.MaxRate) {
-		c.coldStart = false
+		c.coldStart = false // nothing left to discover above the ceiling
 	}
 	c.setRate(int(math.Round(c.rate)))
 }
 
 // rampUp reports whether this healthy tick should probe multiplicatively rather
-// than additively: only while the limiter has never seen congestion, because then
-// it has no idea where the knee is and doubling finds it in log2 ticks.
-//
-// It used to also fire on recovery — latency far below the window — and that was
-// removed. It bought 25 -> 52 req/s when capacity came back and cost 59 -> 46 when
-// capacity dropped, because doubling is also how you overshoot a cliff; a half
-// measure with a real downside is worse than a documented "we do not do this".
-// See docs/design.md §9.6 for the numbers.
+// than additively: only before the first observed congestion.
 func (c *controller) rampUp() bool {
 	return c.coldStart && c.cfg.SlowStartGain > 1
 }
 
 // tailTarget is the latency at which the p99 guard fires, or zero when the guard
 // is off.
-//
-// It is SLOTarget scaled by TailFactor because SLOTarget is asked to be three
-// things at once: the window cap (0.8x SLOTarget), the AnchorSLO target, and this
-// guard's threshold — and the guard wants a larger number than the other two. A
-// per-tick p99 crossing the number you also promise as an SLO is normal for a
-// service that meets its SLO, and the guard costs -DownStep on every tick it
-// fires, so a guard pinned at 1.0x fires on about half the ticks and walks the
-// rate to MinRate. Raising SLOTarget to fix that would also widen the window and
-// move the anchor; this knob moves only the guard.
-//
-// The default factor is 1, which is the behaviour every measurement in the docs
-// was taken with: it is a knob, not a silent change of the old law.
 func (c *controller) tailTarget() time.Duration {
 	if c.cfg.SLOTarget <= 0 {
 		return 0
@@ -371,19 +187,8 @@ func (c *controller) tailTarget() time.Duration {
 	return time.Duration(float64(c.cfg.SLOTarget) * c.cfg.TailFactor)
 }
 
-// tailSigma is how many standard errors above the tolerance the observed ratio
-// has to be before the guard fires.
-//
-// Three is the conventional "this is not noise" bar, and it is deliberately a
-// statistical convention rather than a tuned number: the caller supplies the
-// policy (what share of traffic may be slow) and the controller supplies the
-// evidence bar, derived from the sample count it actually has. That is what makes
-// "set the tolerance to 2x the cohort" unnecessary — on a busy service the margin
-// is small, and on a quiet one it is large because the measurement is weaker.
-const tailSigma = 3.0
-
 // snapshotTail is the threshold the histogram should count observations above,
-// or zero to skip the count. Only ratio mode needs it: quantile mode reads p99.
+// or zero to skip the count.
 func (c *controller) snapshotTail() time.Duration {
 	if c.cfg.TailTolerance <= 0 {
 		return 0
@@ -393,23 +198,6 @@ func (c *controller) snapshotTail() time.Duration {
 
 // window returns the tolerated latency band for this tick, as absolute
 // nanoseconds.
-//
-// Under AnchorBaseline the band moves with the healthy baseline — up to
-// (1+TargetInflation) x baseline, with a deadband under it so noise in the hold
-// zone does not move the rate — and the SLO caps it from above.
-//
-// That cap is not symmetric, and the asymmetry is the whole reason AnchorSLO
-// exists: capping can only *lower* the window, never raise it. So when the
-// baseline is small the SLO contributes nothing at all, and the controller
-// treats a latency that is still a quarter of the SLO as congestion merely
-// because it is 2.5x the fastest response the downstream ever gave. Targeting a
-// latency the SLO will reject is self-defeating by construction, so the cap
-// itself is right; what is wrong is letting the ratio decide a backoff when the
-// absolute number has plenty of room.
-//
-// Under AnchorSLO the band is sloWindowFraction x SLOTarget outright, and the
-// baseline is not consulted. The deadband still applies, so the hold zone is the
-// top 5% below the threshold rather than the whole distance to the SLO.
 func (c *controller) window() (high, low float64) {
 	ceiling := float64(0)
 	if c.cfg.SLOTarget > 0 {
@@ -421,10 +209,7 @@ func (c *controller) window() (high, low float64) {
 	} else {
 		high = c.slow * (1 + c.cfg.TargetInflation)
 		if ceiling > 0 && high > ceiling {
-			// Never aim above the SLO: a permissive TargetInflation (the 1.0
-			// default tolerates 2x baseline) would otherwise park the controller
-			// on the SLO boundary, where ordinary jitter pushes half the requests
-			// over it.
+			// Never aim above the SLO.
 			high = ceiling
 		}
 	}
@@ -456,18 +241,12 @@ func (c *controller) stats() Stats {
 }
 
 // outageFactor is how far above the tolerated window a synthetic sample for an
-// unreachable downstream is placed. It only has to land above `high`, and above
-// SLOTarget so that the p99 tail guard fires as well.
+// unreachable downstream is placed.
 const outageFactor = 1.5
 
 // outageSample returns the latency to record when a call never reached the
 // downstream, so that "the connection was refused" reads as congestion instead
 // of as a zero-latency healthy response.
-//
-// The second result is false when there is nothing to anchor against — no
-// SLOTarget and no baseline yet. Recording a made-up number then would seed the
-// baseline with it and teach the controller the wrong healthy latency, so the
-// caller must record nothing instead.
 func (c *controller) outageSample() (time.Duration, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()

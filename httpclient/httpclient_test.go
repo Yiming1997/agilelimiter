@@ -66,7 +66,6 @@ func (c *countingTransport) RoundTrip(*http.Request) (*http.Response, error) {
 func newLimiter(t *testing.T, cfg agilelimiter.Config) *agilelimiter.Limiter {
 	t.Helper()
 	cfg.Tick = 10 * time.Millisecond
-	cfg.FastHalfLife = 10 * time.Millisecond
 	cfg.SlowHalfLife = 10 * time.Millisecond
 	lim := agilelimiter.New(cfg)
 	lim.Start()

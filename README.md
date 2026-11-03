@@ -40,9 +40,11 @@ is still acceptable. Everything else is policy, and policy comes from a preset.
 
 ```go
 cfg := agilelimiter.Config{
-	MaxRate:  500,                     // the ceiling you promise the downstream
-	SLOTarget: 200 * time.Millisecond, // the red line
-	Preset:   agilelimiter.PresetLatencyFirst,
+	MaxRate:   500,                     // the ceiling you promise the downstream
+	FloorRate: 250,                     // normal floor: near your safe static rate
+	ProbeRate: 10,                      // outage floor: low enough to keep probing
+	SLOTarget: 200 * time.Millisecond,  // the red line
+	Preset:    agilelimiter.PresetLatencyFirst,
 }
 if err := cfg.Validate(); err != nil { // optional; do it in tests
 	log.Fatal(err)
@@ -78,14 +80,19 @@ to move:
 | field | why you would set it |
 |---|---|
 | `MaxRate` | required: the rate you promise the downstream |
+| `FloorRate` | normal floor: the static rate you trust in the worst healthy case |
+| `ProbeRate` | outage floor: the low rate used while calls never reach the downstream |
 | `SLOTarget` | the red line — also enables the tail guard and the SLO anchor |
 | `Preset` | picks the policy: anchor, hysteresis, tolerated multiple |
 | `TailTolerance` | optional, set once: your tail is made of different request types |
 | `Classify` | correctness rather than tuning: which failures never reached the downstream |
 
+`MinRate` is kept as a compatibility fallback: if `FloorRate` or `ProbeRate` is
+zero, it inherits `MinRate`.
+
 `Config()` returns a `Resolved` snapshot (defaults applied, presets expanded, an
 SLO anchor that could not be honoured reported rather than hidden). `Validate()`
-reports the configs `New` would otherwise repair in silence — `MinRate` above
+reports the configs `New` would otherwise repair in silence — `FloorRate` above
 `MaxRate`, a `Deadband` of 1 that makes every latency "healthy", `AnchorSLO`
 without a `SLOTarget`.
 
@@ -141,7 +148,8 @@ call path has exactly one of the two:
 
 ```go
 lim := agilelimiter.New(agilelimiter.Config{
-	MinRate:   20,
+	FloorRate: 250,
+	ProbeRate: 10,
 	MaxRate:   500,
 	SLOTarget: 200 * time.Millisecond,
 	Classify: func(err error) agilelimiter.Outcome {
@@ -160,7 +168,7 @@ lim := agilelimiter.New(agilelimiter.Config{
 | `Outcome` | When | What the controller is told |
 |---|---|---|
 | `Reached` | it reached the downstream and came back — 2xx, 5xx, timeout | the measured round trip, as usual |
-| `Unreachable` | it never arrived — refused, DNS, TLS, open breaker | a synthetic "congested" sample, so it backs off toward `MinRate` |
+| `Unreachable` | it never arrived — refused, DNS, TLS, open breaker | a synthetic "congested" sample, so it backs off toward `ProbeRate` |
 | `Aborted` | the caller gave up, or the call never started | nothing |
 
 Details that matter:
@@ -172,17 +180,19 @@ Details that matter:
   `SLOTarget`, so the fixed-step median backoff *and* the p99 tail guard both fire.
   It is a no-op before there is anything to anchor against (no `SLOTarget`, no
   sample yet) — inventing a baseline value would be worse than staying silent.
-- **`MinRate` is the outage probe rate.** Backing off to 20 req/s is how the
+- **`ProbeRate` is the outage probe rate.** Backing off to 10 req/s is how the
   limiter keeps testing whether the downstream came back. Make sure it is a rate
-  the downstream can absorb (× your instance count).
+  the downstream can absorb (× your instance count). Normal traffic is clamped at
+  the higher `FloorRate`; only outage mode may go below it.
 - On the manual `Take`/`Observe` path, call `lim.Unavailable()` instead of
   `Observe` for that attempt. Never both — that records two samples for one call.
+  A subsequent normal `Observe` leaves outage mode.
 - `ConcurrencyLimiter` has the same options, for handlers that answer 503 without
   doing any work: `Config.Classify` and `lim.Unavailable()`.
 
 Pair this with a circuit breaker. The breaker decides "stop calling"; the limiter
 decides "how much of the remaining capacity to use". Without a breaker you still
-pay a full network timeout on every call while the limiter sits at `MinRate`.
+pay a full network timeout on every call while the limiter sits at `ProbeRate`.
 
 ## Downstream caches: don't let hits drive the controller
 
@@ -283,7 +293,8 @@ Each tick:
 4. If the tail guard fires — `p99` above `SLOTarget x TailFactor`, or (in ratio
    mode) the smoothed fraction of the tick above the target exceeding
    `TailTolerance + 3σ` — force a full `-DownStep`.
-5. Clamp to `[MinRate, MaxRate]` and push to the bucket.
+5. Clamp to `[FloorRate, MaxRate]` — or `[ProbeRate, MaxRate]` while in outage
+   mode — and push to the bucket.
 
 **Asymmetry is intentional**: back off fast (30%/tick), ramp up slowly (5%/tick).
 It is friendlier to the downstream and resists oscillation around the knee. The

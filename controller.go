@@ -44,6 +44,10 @@ type controller struct {
 	slow  float64 // slow EWMA baseline of p50, nanoseconds
 	rate  float64 // current target rate, requests per second
 	ready bool
+	// probe is true after an unreachable call and until a normal observed call
+	// arrives. It lets the rate fall to ProbeRate without making that low floor
+	// the normal operating floor.
+	probe bool
 
 	// coldStart is true until the controller has seen congestion. While it is
 	// true a healthy tick multiplies the rate instead of adding UpStep.
@@ -184,7 +188,7 @@ func (c *controller) step() {
 		}
 	}
 
-	c.rate = clampRate(c.rate*factor, c.cfg.MinRate, c.cfg.MaxRate)
+	c.rate = clampRate(c.rate*factor, c.floor(), c.cfg.MaxRate)
 	if c.rate >= float64(c.cfg.MaxRate) {
 		c.coldStart = false // nothing left to discover above the ceiling
 	}
@@ -259,6 +263,21 @@ func (c *controller) stats() Stats {
 	}
 }
 
+// floor is the lower clamp for the current mode. It is called with c.mu held.
+func (c *controller) floor() int {
+	if c.probe {
+		return c.cfg.ProbeRate
+	}
+	return c.cfg.FloorRate
+}
+
+// clearProbe returns the controller to the normal floor after a normal sample.
+func (c *controller) clearProbe() {
+	c.mu.Lock()
+	c.probe = false
+	c.mu.Unlock()
+}
+
 // outageFactor is how far above the tolerated window a synthetic sample for an
 // unreachable downstream is placed.
 const outageFactor = 1.5
@@ -270,6 +289,7 @@ func (c *controller) outageSample() (time.Duration, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	c.probe = true
 	if slo := float64(c.cfg.SLOTarget); slo > 0 {
 		v := slo * outageFactor
 		if r := c.slow * outageFactor; r > v {

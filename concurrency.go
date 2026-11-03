@@ -19,11 +19,13 @@ type ConcurrencyConfig struct {
 	// Preset fills the policy fields you leave at zero (see Config.Preset).
 	Preset Preset
 
-	// MinLimit and MaxLimit bound the dynamic concurrency limit, in requests.
-	// MaxLimit is the *hard ceiling* you are willing to promise the service.
-	// MaxLimit is required: there is no sensible default for it.
-	MinLimit int
-	MaxLimit int
+	// MinLimit is the legacy fallback for FloorLimit and ProbeLimit.
+	// FloorLimit is the normal operating floor; ProbeLimit is the floor while
+	// the service is unreachable. MaxLimit is the hard ceiling.
+	MinLimit   int
+	FloorLimit int
+	ProbeLimit int
+	MaxLimit   int
 	// InitialLimit is the starting concurrency. Cold-start low and let the
 	// controller ramp up — starting at MaxLimit risks flooding yourself before
 	// the first feedback arrives.
@@ -121,6 +123,8 @@ func (cc ConcurrencyConfig) toConfig() Config {
 	return Config{
 		Preset:           cc.Preset,
 		MinRate:          cc.MinLimit,
+		FloorRate:        cc.FloorLimit,
+		ProbeRate:        cc.ProbeLimit,
 		MaxRate:          cc.MaxLimit,
 		InitialRate:      cc.InitialLimit,
 		SLOTarget:        cc.SLOTarget,

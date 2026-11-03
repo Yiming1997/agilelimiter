@@ -28,8 +28,10 @@ max RTT, via Little's Law). Columns: completed requests/s, goodput/s (within
 SLO), % of requests within SLO, mean and p99 latency, and the final rate.
 
 The agile config used throughout: `InitialRate=40`, `MaxRate=500`,
-`SLOTarget=100ms` (== the SLO), `FastHalfLife=750ms`, `SlowHalfLife=45s`,
-`TargetInflation=2.5`, `Tick=250ms`.
+`SLOTarget=100ms` (== the SLO), `SlowHalfLife=45s`, `TargetInflation=2.5`,
+`Tick=250ms`. These numbers were taken on a build that still had a fast EWMA
+(`FastHalfLife=750ms`); that field was removed in `feat/simple-controller`, and
+the controller now compares the tick's p50 directly.
 
 ## Case 1 — steady but UNKNOWN capacity: 150 req/s
 

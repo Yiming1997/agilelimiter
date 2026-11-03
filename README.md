@@ -9,8 +9,8 @@ independent places, so the controller can never exceed a number you are willing
 to promise.
 
 ```
-downstream RTT ──> histogram (p50/p99) ──> fast/slow EWMA ──> rate factor ──> clamp[min,max] ──> bucket.SetRate
-   (Observe)                                     (baseline)      gradient/AIMD
+downstream RTT ──> histogram (p50/p99) ──> p50 vs slow baseline ──> rate factor ──> clamp[min,max] ──> bucket.SetRate
+   (Observe)                                  (target window)          AIMD / hold
 ```
 
 ## Files
@@ -19,7 +19,7 @@ downstream RTT ──> histogram (p50/p99) ──> fast/slow EWMA ──> rate f
 |---|---|
 | `bucket.go` | Simplest leaky bucket; `setRate` hot-updates the rate. |
 | `histogram.go` | Lock-free log-bucketed histogram (p50/p99), reset each tick. |
-| `controller.go` | Fast/slow EWMA baseline + gradient decrease / additive increase + p99 guard. |
+| `controller.go` | Slow EWMA baseline + fixed-step AIMD + p99/ratio tail guard. |
 | `limiter.go` | `Config`, `New`, `Do` (and the generic `Do[T]`), the lower-level `Take`/`Observe`, `Rate`, `Stats`, `Start`, `Stop`. |
 | `semaphore.go` | Concurrency actuator for inbound limiting; non-blocking `tryAcquire`. |
 | `concurrency.go` | `ConcurrencyConfig`, `NewConcurrency`, `TryTake`, `Release`, `Do`, `Limit`. |
@@ -280,8 +280,9 @@ Each tick:
      limiter has never seen congestion (cold start — see below).
    - `p50 >= high` → congested, fixed `-DownStep`.
    - in between → hold (deadband).
-4. If the tail guard fires — `p99` above `SLOTarget x TailFactor`, or a plain
-   observed ratio above `TailTolerance` — force a full `-DownStep`.
+4. If the tail guard fires — `p99` above `SLOTarget x TailFactor`, or (in ratio
+   mode) the smoothed fraction of the tick above the target exceeding
+   `TailTolerance + 3σ` — force a full `-DownStep`.
 5. Clamp to `[MinRate, MaxRate]` and push to the bucket.
 
 **Asymmetry is intentional**: back off fast (30%/tick), ramp up slowly (5%/tick).
@@ -408,7 +409,7 @@ resets both counters, so the agreement has to be in a row, not merely cumulative
 
 The limiter above protects a *downstream*. To protect a *service you run* — the
 inbound direction — use `ConcurrencyLimiter` instead. It shares the same brain
-(the fast/slow EWMA baseline, target window and p99 guard) but swaps the actuator
+(p50 signal, slow baseline, target window and p99 guard) but swaps the actuator
 from a leaky bucket to a concurrency semaphore, because the inbound problem is
 different:
 
@@ -621,10 +622,10 @@ limiter with the pollution removed:
 | 50ms of caller work, sample crosses `SLOTarget` | 135/s | **24/s, 0% in SLO** | same pollution, now it trips the guard |
 
 **The relative window is self-correcting; the guard is not.** In every row that
-collapsed, the median law said *healthy*: a constant offset moves `fast` and
-`slow` together, and a ratio does not care about it. The absolute comparison
-does, and it turns a polluted sample into a 30%-per-tick backoff straight to
-`MinRate`.
+collapsed, the median law said *healthy*: a constant offset moves the tick's p50
+and the baseline together, and a ratio does not care about it. The absolute
+comparison does, and it turns a polluted sample into a 30%-per-tick backoff
+straight to `MinRate`.
 
 **The guard compares one tick's p99 against `SLOTarget`.** A SLO is a fraction
 over a long window ("99% of requests under 200ms"); a per-tick p99 crossing that

@@ -27,7 +27,9 @@ cd compare && go test -run '^TestSweep' -v -timeout 40m .
 
 - 每个 arm 先跑一段 **预热期不计分**（入站 3s，出站 8~10s），只统计之后 6~20s 的稳态。控制器按设计就是慢的（探测速率很危险），拿爬坡阶段评分没有意义。
 - 自适应一侧用**中性起点**预热（入站初始并发 100，出站初始速率 50），既不是答案也不是地板。
-- 控制环参数接近库默认值：`Tick=250ms`、`UpStep=5%`、`DownStep=30%`、`FastHalfLife=750ms`、`TargetInflation=2.5`、`SLOTarget` 设为业务 SLO。
+- 控制环参数接近库默认值：`Tick=250ms`、`UpStep=5%`、`DownStep=30%`、`TargetInflation=2.5`、`SLOTarget` 设为业务 SLO。
+  这批数据测于 `FastHalfLife` 尚存在的版本（当时设 `750ms`）；该字段已在 `feat/simple-controller` 中移除，
+  现在的控制器直接拿本拍 p50 比较，不再有快滤波。
 - **延迟在"拿到许可的那一刻"采样**，不是在排队之前。这一点很关键：速率一旦被压到 MinRate，`Take()` 会阻塞几十秒，用排队前的快照建模会让控制器永远看到过期的延迟，然后锁死在最低速——我第一版就是这么把出站结果测成废数据的。
 - 出站动态场景的阶段长度必须远大于模型最大 RTT（3s），否则请求跨阶段完成，相位归因整体滞后一个 RTT。
 

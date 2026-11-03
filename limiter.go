@@ -68,18 +68,28 @@ type Config struct {
 	// wins over the preset; see applyPreset for the exact table.
 	Preset Preset
 
-	// MinRate and MaxRate bound the dynamic rate, in requests per second.
-	// MaxRate is the *hard ceiling* you are willing to promise — the one number
-	// the caller must supply. MinRate is the outage probe rate: the rate the
-	// limiter keeps retrying at when the downstream is down, so it must be small
-	// enough for the downstream to absorb (times your instance count) and big
-	// enough that recovery is noticed quickly. Its default of 1 is fine.
-	MinRate int
-	MaxRate int
+	// MinRate is the legacy fallback for FloorRate and ProbeRate. New code
+	// should set the two explicitly.
+	//
+	// FloorRate is the normal operating floor: while the downstream is healthy
+	// the controller will not go below it. Set it near the static rate you
+	// would trust in the worst healthy case; the adaptive part is then upside,
+	// not a bet on finding the knee from a low floor.
+	//
+	// ProbeRate is the outage floor: when a call never reached the downstream,
+	// the controller is allowed to fall this low to keep probing without
+	// hammering a dependency that is already down. It must be <= FloorRate.
+	//
+	// MaxRate is the hard ceiling. MinRate is kept as a compatibility fallback:
+	// if FloorRate/ProbeRate are zero they inherit MinRate.
+	MinRate   int
+	FloorRate int
+	ProbeRate int
+	MaxRate   int
 	// InitialRate is the starting rate. When zero it is derived from MaxRate
-	// (MaxRate/8, at least MinRate) rather than set to MinRate: the controller
-	// comes down fast and goes up slowly, so guessing high costs a couple of
-	// ticks while guessing low costs ln(MaxRate/MinRate) of them.
+	// (MaxRate/8, at least FloorRate): the controller comes down fast and goes
+	// up slowly, so guessing high costs a couple of ticks while guessing low
+	// costs ln(MaxRate/FloorRate) of them.
 	InitialRate int
 
 	// SLOTarget enables the tail-latency guard: when the per-tick p99 exceeds
@@ -335,8 +345,26 @@ func withDefaults(c Config) Config {
 	if c.MinRate < 1 {
 		c.MinRate = 1
 	}
+	if c.FloorRate <= 0 {
+		c.FloorRate = c.MinRate
+	}
+	if c.ProbeRate <= 0 {
+		c.ProbeRate = c.MinRate
+	}
+	if c.FloorRate < 1 {
+		c.FloorRate = 1
+	}
+	if c.ProbeRate < 1 {
+		c.ProbeRate = 1
+	}
+	if c.ProbeRate > c.FloorRate {
+		c.ProbeRate = c.FloorRate
+	}
 	if c.MaxRate < c.MinRate {
 		c.MaxRate = c.MinRate
+	}
+	if c.MaxRate < c.FloorRate {
+		c.MaxRate = c.FloorRate
 	}
 	if c.InitialRate <= 0 {
 		// Start at a fraction of the ceiling, not at the floor. Coming down from
@@ -344,8 +372,8 @@ func withDefaults(c Config) Config {
 		// slow start finds the knee in a handful of ticks either way.
 		c.InitialRate = c.MaxRate / 8
 	}
-	if c.InitialRate < c.MinRate {
-		c.InitialRate = c.MinRate
+	if c.InitialRate < c.FloorRate {
+		c.InitialRate = c.FloorRate
 	}
 	if c.InitialRate > c.MaxRate {
 		c.InitialRate = c.MaxRate
@@ -446,7 +474,10 @@ func (l *Limiter) Take() time.Time { return l.bucket.take() }
 // Observe records one downstream round-trip time. Feed it the latency measured
 // from the moment the request was actually sent, NOT including this limiter's
 // own throttle wait. Safe for concurrent use and allocation-free.
-func (l *Limiter) Observe(rtt time.Duration) { l.hist.record(rtt) }
+func (l *Limiter) Observe(rtt time.Duration) {
+	l.ctrl.clearProbe()
+	l.hist.record(rtt)
+}
 
 // Do runs fn as one rate-limited downstream call: it takes a slot from the
 // bucket, times fn, and feeds the outcome back to the controller. Callers never
@@ -512,6 +543,7 @@ func (l *Limiter) observeOutcome(d time.Duration, err error) {
 	case out == Aborted:
 		// Nothing: the downstream never expressed an opinion.
 	default:
+		l.ctrl.clearProbe()
 		l.hist.record(d)
 	}
 }
@@ -638,6 +670,8 @@ type Resolved struct {
 
 	MaxRate     int
 	MinRate     int
+	FloorRate   int
+	ProbeRate   int
 	InitialRate int
 
 	// Anchor is "baseline", "slo", or "baseline (AnchorSLO requested without
@@ -685,6 +719,8 @@ func resolve(cfg Config, kind string) Resolved {
 		Preset:           cfg.Preset.String(),
 		MaxRate:          cfg.MaxRate,
 		MinRate:          cfg.MinRate,
+		FloorRate:        cfg.FloorRate,
+		ProbeRate:        cfg.ProbeRate,
 		InitialRate:      cfg.InitialRate,
 		SLOTarget:        cfg.SLOTarget,
 		TailFactor:       cfg.TailFactor,
@@ -753,8 +789,21 @@ func (c Config) Validate() error {
 
 	if c.MaxRate <= 0 {
 		add("MaxRate is required: it is the rate you promise the downstream")
-	} else if c.MinRate > c.MaxRate {
-		add("MinRate (%d) exceeds MaxRate (%d): the floor would be the ceiling", c.MinRate, c.MaxRate)
+	} else {
+		floor := c.FloorRate
+		if floor == 0 {
+			floor = c.MinRate
+		}
+		probe := c.ProbeRate
+		if probe == 0 {
+			probe = c.MinRate
+		}
+		if floor > c.MaxRate {
+			add("FloorRate (%d) exceeds MaxRate (%d): the floor would be the ceiling", floor, c.MaxRate)
+		}
+		if probe > floor {
+			add("ProbeRate (%d) exceeds FloorRate (%d): the outage floor would be above the healthy floor", probe, floor)
+		}
 	}
 	if c.InitialRate < 0 || (c.MaxRate > 0 && c.InitialRate > c.MaxRate) {
 		add("InitialRate (%d) must be within [0, MaxRate=%d]", c.InitialRate, c.MaxRate)

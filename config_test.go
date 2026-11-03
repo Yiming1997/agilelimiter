@@ -199,7 +199,7 @@ func TestResolvedDescribesTheGuard(t *testing.T) {
 		TailFactor:    2,
 		TailTolerance: 0.1,
 	}).Config()
-	if ratio.Tail != "10% of requests above 200ms (2.0x SLOTarget)" {
+	if ratio.Tail != "10%+3σ of requests above 200ms (2.0x SLOTarget)" {
 		t.Fatalf("Tail = %q", ratio.Tail)
 	}
 

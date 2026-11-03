@@ -10,6 +10,18 @@ import (
 // Aiming at the SLO itself means ordinary jitter pushes half the requests over it.
 const sloWindowFraction = 0.8
 
+// tailSigma is how many standard errors above the tolerance the observed ratio
+// has to be before the guard fires.
+//
+// Three is the conventional "this is not noise" bar, and it is deliberately a
+// statistical convention rather than a tuned number: the caller supplies the
+// policy (what share of traffic may be slow) and the controller supplies the
+// evidence bar, derived from the sample count it actually has. That is what
+// makes "set the tolerance to 2x the cohort" unnecessary — on a busy service the
+// margin is small, and on a quiet one it is large because the measurement is
+// weaker.
+const tailSigma = 3.0
+
 // controller turns the latency signal into a target rate.
 //
 // The simplified law is intentionally small:
@@ -46,8 +58,9 @@ type controller struct {
 	over      float64
 	overAlpha float64
 
-	// tailThreshold is the caller's TailTolerance. The simplified law uses the
-	// plain observed ratio, without a binomial margin.
+	// tailThreshold is the effective firing threshold: the caller's tolerance
+	// plus tailSigma standard errors, recomputed each tick from the sample
+	// count. It is only meaningful when TailTolerance > 0.
 	tailThreshold float64
 
 	lastP50, lastP99 time.Duration
@@ -141,17 +154,23 @@ func (c *controller) step() {
 		c.above, c.below = 0, 0
 	}
 
-	// One tail rule: a plain exceedance ratio or the p99 quantile. TailFactor
-	// is still useful for heterogeneous endpoints; there is no statistical
-	// margin in this law.
+	// One tail rule: a plain exceedance ratio or the p99 quantile.
+	//
+	// The tolerance is the caller's policy; the margin is the controller's
+	// evidence. A per-tick exceedance ratio is a binomial proportion, so its
+	// standard error is sqrt(p(1-p)/n) — which is why the same tolerance needs a
+	// wider margin on a low-traffic service than on a busy one. The EWMA
+	// averages about 1/varianceFactor ticks, so sigma is scaled by
+	// sqrt(alpha/(2-alpha)) to describe the smoothed estimate.
 	if tol := c.cfg.TailTolerance; tol > 0 {
 		c.over += c.overAlpha * (float64(above)/float64(n) - c.over)
-		c.tailThreshold = tol
+		sigma := math.Sqrt(tol*(1-tol)/float64(n)) * math.Sqrt(c.overAlpha/(2-c.overAlpha))
+		c.tailThreshold = tol + tailSigma*sigma
 	}
 	if tail := c.tailTarget(); tail > 0 {
 		switch {
 		case c.cfg.TailTolerance > 0:
-			if c.over > c.cfg.TailTolerance && float64(above) > c.cfg.TailTolerance*float64(n) {
+			if c.over > c.tailThreshold && float64(above) > c.cfg.TailTolerance*float64(n) {
 				if floor := 1 - c.cfg.DownStep; factor > floor {
 					factor = floor
 				}

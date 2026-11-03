@@ -49,7 +49,6 @@ func main() {
 		MaxLimit:     200,
 		InitialLimit: 10,
 		SLOTarget:    slo,
-		FastHalfLife: 500 * time.Millisecond,
 		SlowHalfLife: 30 * time.Second,
 		Tick:         100 * time.Millisecond,
 	})

@@ -88,7 +88,7 @@ func TestUnreachableIsNoOpWithoutAnAnchor(t *testing.T) {
 
 func TestUnreachableSampleReadsAsCongestion(t *testing.T) {
 	// With a baseline but no SLOTarget the synthetic sample must still land above
-	// the tolerated window, so the proportional backoff fires.
+	// the tolerated window, so the fixed-step backoff fires.
 	l := New(Config{MinRate: 10, MaxRate: 1000, InitialRate: 200})
 	feed(l, 10*time.Millisecond, 100) // baseline = 10ms
 	high := 2 * 10 * time.Millisecond // (1+TargetInflation) x baseline, default 1.0

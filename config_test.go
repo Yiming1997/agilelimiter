@@ -18,7 +18,7 @@ func TestPresetNoneChangesNothing(t *testing.T) {
 	if none != balanced {
 		t.Fatalf("PresetBalanced must equal PresetNone:\n none:     %+v\n balanced: %+v", none, balanced)
 	}
-	if none.Tick != time.Second || none.FastHalfLife != 3*time.Second ||
+	if none.Tick != time.Second ||
 		none.SlowHalfLife != 45*time.Second || none.Anchor != "baseline" ||
 		none.BackoffTicks != 1 || none.RecoverTicks != 1 {
 		t.Fatalf("shipped defaults changed: %+v", none)
@@ -109,7 +109,6 @@ func TestValidate(t *testing.T) {
 		{"deadband of one", Config{MaxRate: 120, Deadband: 1}, "Deadband"},
 		{"downstep over one", Config{MaxRate: 120, DownStep: 1.2}, "DownStep"},
 		{"tick too long", Config{MaxRate: 120, Tick: 30 * time.Second}, "Tick"},
-		{"half life under tick", Config{MaxRate: 120, Tick: time.Second, FastHalfLife: time.Second}, "FastHalfLife"},
 		{"negative slow start", Config{MaxRate: 120, SlowStartGain: 0.5}, "SlowStartGain"},
 	}
 

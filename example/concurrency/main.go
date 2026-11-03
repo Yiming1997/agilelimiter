@@ -65,7 +65,6 @@ func main() {
 		InitialLimit:    20,  // cold-start low, let the controller ramp up
 		SLOTarget:       500 * time.Millisecond,
 		Tick:            tick,
-		FastHalfLife:    300 * time.Millisecond,
 		SlowHalfLife:    3 * time.Second,
 		TargetInflation: 0.5, // tolerate handling time up to 1.5x baseline
 	})

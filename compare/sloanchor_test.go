@@ -96,7 +96,6 @@ func agileAnchor(anchor agilelimiter.Anchor, inflation float64, ticks int) func(
 			MaxRate:         agileCeiling,
 			InitialRate:     40,
 			SLOTarget:       slo,
-			FastHalfLife:    750 * time.Millisecond,
 			SlowHalfLife:    45 * time.Second,
 			TargetInflation: inflation,
 			Tick:            250 * time.Millisecond,

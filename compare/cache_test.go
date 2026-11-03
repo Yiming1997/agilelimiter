@@ -97,12 +97,10 @@ func runCacheArm(observeAll bool) ([]*cachePhase, float64) {
 		MaxRate:          3000,
 		InitialRate:      50,
 		SLOTarget:        cacheSLO,
-		FastHalfLife:     750 * time.Millisecond,
 		SlowHalfLife:     10 * time.Second,
 		SlowDownHalfLife: time.Second,
 		UpStep:           0.05,
 		DownStep:         0.30,
-		Gain:             1.0,
 		Deadband:         0.08,
 		Tick:             250 * time.Millisecond,
 	})

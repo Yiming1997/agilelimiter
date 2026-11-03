@@ -102,7 +102,6 @@ func agilePolluted() (limiter, func()) {
 		MaxRate:      pollCeiling,
 		InitialRate:  pollInit,
 		SLOTarget:    pollSLO,
-		FastHalfLife: 750 * time.Millisecond,
 		SlowHalfLife: 45 * time.Second,
 		Tick:         250 * time.Millisecond,
 	})
@@ -119,7 +118,6 @@ func agileTolerance(tol float64) func() (limiter, func()) {
 			InitialRate:   pollInit,
 			SLOTarget:     pollSLO,
 			TailTolerance: tol,
-			FastHalfLife:  750 * time.Millisecond,
 			SlowHalfLife:  45 * time.Second,
 			Tick:          250 * time.Millisecond,
 		})
@@ -161,11 +159,11 @@ func TestTailTolerance(t *testing.T) {
 
 // marginCell is one point of the margin sweep.
 type marginCell struct {
-	rate      int
-	cohortPct int
-	samples   float64 // mean samples per tick, i.e. the measurement's power
-	minRate   float64 // lowest target rate after the first second
-	meanOver  float64
+	rate       int
+	cohortPct  int
+	samples    float64 // mean samples per tick, i.e. the measurement's power
+	minRate    float64 // lowest target rate after the first second
+	meanOver   float64
 	meanThresh float64
 }
 
@@ -181,7 +179,6 @@ func runCell(rate, cohortPct int, tol float64, dur time.Duration) marginCell {
 		InitialRate:   rate,
 		SLOTarget:     pollSLO,
 		TailTolerance: tol,
-		FastHalfLife:  750 * time.Millisecond,
 		SlowHalfLife:  45 * time.Second,
 		Tick:          250 * time.Millisecond,
 	})

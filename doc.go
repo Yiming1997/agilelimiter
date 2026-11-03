@@ -9,17 +9,15 @@
 //
 // Control loop (per tick):
 //
-//	fast EWMA (short half-life)  ─┐
-//	slow EWMA (long half-life)   ─┼─> target window ─> adjust rate ─> clamp ─> bucket.SetRate
-//	p99 (per-tick histogram)     ─┘   (baseline)       AIMD / hold    [min,max]
-//	                                                     + p99 SLO guard
+//	p50 (per-tick histogram)  ─┐
+//	slow baseline (one EWMA)  ─┼─> target window ─> AIMD / hold ─> clamp ─> bucket.SetRate
+//	p99 (per-tick histogram)  ─┘   (baseline)       + p99 SLO guard
 //
-// The fast EWMA of the recent median is compared against a window derived from
-// the slow EWMA baseline: while fast latency stays under (1+TargetInflation) x
-// baseline the controller probes the rate up; once it rises past that window it
-// backs off proportionally, capped at DownStep. Operating with some queuing —
-// rather than backing off at the first sign of it — is what keeps utilization
-// reasonable.
+// The tick's median is compared against a window derived from the slow EWMA
+// baseline: while it stays under (1+TargetInflation) x baseline the controller
+// probes the rate up; once it rises past that window it backs off by a fixed
+// step. Operating with some queuing — rather than backing off at the first sign
+// of it — is what keeps utilization reasonable.
 //
 // Measurement discipline (important): feed Observe the *downstream* round-trip
 // time — measured from the moment the request is actually sent, NOT from the

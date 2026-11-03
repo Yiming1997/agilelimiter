@@ -58,7 +58,6 @@ func main() {
 		MaxRate:         500, // hard ceiling we promise the downstream
 		InitialRate:     20,  // cold-start low, let the controller ramp up
 		Tick:            tick,
-		FastHalfLife:    300 * time.Millisecond, // responsive to recent latency
 		SlowHalfLife:    3 * time.Second,        // healthy baseline
 		TargetInflation: 1.5,                    // tolerate latency up to 2.5x baseline
 		SLOTarget:       500 * time.Millisecond, // tail guard

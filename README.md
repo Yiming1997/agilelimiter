@@ -9,8 +9,8 @@ independent places, so the controller can never exceed a number you are willing
 to promise.
 
 ```
-downstream RTT ──> histogram (p50/p99) ──> fast/slow EWMA ──> rate factor ──> clamp[min,max] ──> bucket.SetRate
-   (Observe)                                     (baseline)      gradient/AIMD
+downstream RTT ──> histogram (p50/p99) ──> p50 vs slow baseline ──> rate factor ──> clamp[min,max] ──> bucket.SetRate
+   (Observe)                                  (target window)          AIMD / hold
 ```
 
 ## Files
@@ -19,7 +19,7 @@ downstream RTT ──> histogram (p50/p99) ──> fast/slow EWMA ──> rate f
 |---|---|
 | `bucket.go` | Simplest leaky bucket; `setRate` hot-updates the rate. |
 | `histogram.go` | Lock-free log-bucketed histogram (p50/p99), reset each tick. |
-| `controller.go` | Fast/slow EWMA baseline + gradient decrease / additive increase + p99 guard. |
+| `controller.go` | Slow EWMA baseline + fixed-step AIMD + p99/ratio tail guard. |
 | `limiter.go` | `Config`, `New`, `Do` (and the generic `Do[T]`), the lower-level `Take`/`Observe`, `Rate`, `Stats`, `Start`, `Stop`. |
 | `semaphore.go` | Concurrency actuator for inbound limiting; non-blocking `tryAcquire`. |
 | `concurrency.go` | `ConcurrencyConfig`, `NewConcurrency`, `TryTake`, `Release`, `Do`, `Limit`. |
@@ -169,7 +169,7 @@ Details that matter:
   is opt-in. It is right for anything the downstream answered; it is wrong only
   for calls that never arrived, and only you can tell the difference.
 - The synthetic sample is placed above the tolerated window and above
-  `SLOTarget`, so the proportional backoff *and* the p99 tail guard both fire.
+  `SLOTarget`, so the fixed-step median backoff *and* the p99 tail guard both fire.
   It is a no-op before there is anything to anchor against (no `SLOTarget`, no
   sample yet) — inventing a baseline value would be worse than staying silent.
 - **`MinRate` is the outage probe rate.** Backing off to 20 req/s is how the
@@ -271,16 +271,18 @@ cache hit never reaches it, so it never produces a sample.
 Each tick:
 
 1. Take p50/p99 from the per-tick histogram.
-2. Update `fast` (short half-life) and `slow` (long half-life) EWMAs of p50.
-3. Compare `fast` against a window around the tolerated latency
+2. Update `slow`, the healthy-baseline EWMA of p50. It follows improvements down
+   quickly and rises only slowly.
+3. Compare this tick's p50 against a window around the tolerated latency
    `high = slow * (1 + TargetInflation)`, `low = high * (1 - Deadband)` — or
    against `0.8 * SLOTarget` outright under `AnchorSLO` (see below):
-   - `fast <= low` → healthy, probe up: `+UpStep`, or `×SlowStartGain` while the
+   - `p50 <= low` → healthy, probe up: `+UpStep`, or `×SlowStartGain` while the
      limiter has never seen congestion (cold start — see below).
-   - `fast >= high` → congested, proportional decrease `1 - Gain*(excess/high)`,
-     capped at `-DownStep`.
+   - `p50 >= high` → congested, fixed `-DownStep`.
    - in between → hold (deadband).
-4. If p99 exceeds `SLOTarget x TailFactor`, force a full `-DownStep`.
+4. If the tail guard fires — `p99` above `SLOTarget x TailFactor`, or (in ratio
+   mode) the smoothed fraction of the tick above the target exceeding
+   `TailTolerance + 3σ` — force a full `-DownStep`.
 5. Clamp to `[MinRate, MaxRate]` and push to the bucket.
 
 **Asymmetry is intentional**: back off fast (30%/tick), ramp up slowly (5%/tick).
@@ -407,7 +409,7 @@ resets both counters, so the agreement has to be in a row, not merely cumulative
 
 The limiter above protects a *downstream*. To protect a *service you run* — the
 inbound direction — use `ConcurrencyLimiter` instead. It shares the same brain
-(the fast/slow EWMA baseline, target window and p99 guard) but swaps the actuator
+(p50 signal, slow baseline, target window and p99 guard) but swaps the actuator
 from a leaky bucket to a concurrency semaphore, because the inbound problem is
 different:
 
@@ -620,10 +622,10 @@ limiter with the pollution removed:
 | 50ms of caller work, sample crosses `SLOTarget` | 135/s | **24/s, 0% in SLO** | same pollution, now it trips the guard |
 
 **The relative window is self-correcting; the guard is not.** In every row that
-collapsed, the median law said *healthy*: a constant offset moves `fast` and
-`slow` together, and a ratio does not care about it. The absolute comparison
-does, and it turns a polluted sample into a 30%-per-tick backoff straight to
-`MinRate`.
+collapsed, the median law said *healthy*: a constant offset moves the tick's p50
+and the baseline together, and a ratio does not care about it. The absolute
+comparison does, and it turns a polluted sample into a 30%-per-tick backoff
+straight to `MinRate`.
 
 **The guard compares one tick's p99 against `SLOTarget`.** A SLO is a fraction
 over a long window ("99% of requests under 200ms"); a per-tick p99 crossing that
@@ -698,10 +700,10 @@ request fails. The limiter will happily raise the rate into it.
 - **Coordinated omission.** In the measurement path, never stop sampling when the
   downstream slows. If your workers block and stop issuing calls, you go blind
   exactly when it matters most — a stalled caller produces no sample at all.
-- **Oscillation.** If the rate rings, lengthen the half-lives, increase
-  `Deadband`, shrink `UpStep`, or lower `Gain`.
-- **Observability.** Export `Rate()`, `Stats()` (baseline, fast, the last tick's
-  p50/p99) — and `Stats().Samples` above all: with no samples a step changes
+- **Oscillation.** If the rate rings, lengthen `SlowHalfLife`, increase
+  `Deadband`, or shrink `UpStep`.
+- **Observability.** Export `Rate()`, `Stats()` (baseline, the last tick's p50/p99)
+  — and `Stats().Samples` above all: with no samples a step changes
   nothing, so a *frozen* rate and a *steady* one look identical. Alert on
   `Samples == 0` for more than a few ticks; it is what tells you the controller
   went blind (low traffic, or a pipeline that stopped observing because every

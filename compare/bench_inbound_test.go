@@ -108,7 +108,6 @@ func newInboundAgile(s scenario) (*agilelimiter.ConcurrencyLimiter, func()) {
 		MaxLimit:        500,
 		InitialLimit:    20,
 		SLOTarget:       slo,
-		FastHalfLife:    250 * time.Millisecond,
 		SlowHalfLife:    5 * time.Second,
 		TargetInflation: s.targetInflation,
 		Tick:            100 * time.Millisecond,

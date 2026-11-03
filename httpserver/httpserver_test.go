@@ -187,7 +187,6 @@ func newFastLimiter(t *testing.T) *agilelimiter.ConcurrencyLimiter {
 		MinLimit: 10, MaxLimit: 200, InitialLimit: 100,
 		SLOTarget:        time.Second,
 		Tick:             10 * time.Millisecond,
-		FastHalfLife:     10 * time.Millisecond,
 		SlowHalfLife:     10 * time.Millisecond,
 		SlowDownHalfLife: 10 * time.Millisecond,
 	})

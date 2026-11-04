@@ -49,6 +49,14 @@ type controller struct {
 	// the normal operating floor.
 	probe bool
 
+	// syntheticThisTick counts the outage samples injected since the last
+	// control step. At most one per tick is recorded, for the reason spelled
+	// out in outageSample: a tick either saw refusals or it did not, and letting
+	// the count scale with the fraction of failed calls turns "10% of calls were
+	// refused" into "10% of the traffic was slow", which pins the ratio-mode
+	// tail guard on.
+	syntheticThisTick int
+
 	// coldStart is true until the controller has seen congestion. While it is
 	// true a healthy tick multiplies the rate instead of adding UpStep.
 	coldStart bool
@@ -105,6 +113,9 @@ func (c *controller) step() {
 	defer c.mu.Unlock()
 
 	p50, p99, n, above := c.hist.snapshotAbove(c.snapshotTail())
+	// A new tick is a new window: allow the next outage to record its sample
+	// even if the previous tick already produced one.
+	c.syntheticThisTick = 0
 	c.lastP50, c.lastP99, c.lastSamples = p50, p99, n
 	if n == 0 {
 		return
@@ -285,11 +296,29 @@ const outageFactor = 1.5
 // outageSample returns the latency to record when a call never reached the
 // downstream, so that "the connection was refused" reads as congestion instead
 // of as a zero-latency healthy response.
+//
+// At most ONE synthetic sample is recorded per control tick. That is not an
+// optimisation: the sample is a made-up number, not a measurement, so its count
+// carries no information about how much traffic was refused. Letting it scale
+// with the refusal rate made the ratio-mode tail guard read "10% of calls were
+// refused" as "10% of the traffic was slow" — above the default 5% tolerance, so
+// the guard fired every tick and pinned the rate to the floor. Measured: 5%
+// refusals held 227 req/s, 10% collapsed to 9, and the same collapse happened
+// whether the injected value was 75ms or 1500ms, which is what identified the
+// frequency rather than the magnitude as the cause.
+//
+// One per tick is enough to mean "this tick saw an outage" for both the median
+// law and the guard, and it cannot manufacture a false ratio.
 func (c *controller) outageSample() (time.Duration, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	c.probe = true
+	if c.syntheticThisTick > 0 {
+		return 0, false
+	}
+	c.syntheticThisTick = 1
+
 	if slo := float64(c.cfg.SLOTarget); slo > 0 {
 		v := slo * outageFactor
 		if r := c.slow * outageFactor; r > v {

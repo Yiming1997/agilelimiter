@@ -1,10 +1,10 @@
-package agilelimiter
+package sim
 
 // Robustness: what corrupted input does to the controller.
 //
 // The controller has one input, the stream of observed latencies, and cannot
 // tell a true sample from a false one. Every experiment below runs the outbound
-// model from advantage_sim_test.go, lets the *requests* see the true latency (so
+// model from advantage_test.go, lets the *requests* see the true latency (so
 // goodput is scored honestly) and rewrites what the *limiter* observes. Two ways
 // to break it are measured:
 //
@@ -15,7 +15,7 @@ package agilelimiter
 //
 // Print the tables with:
 //
-//	go test -run '^TestRobust' -v .
+//	go test -run '^TestRobust' -v ./sim
 
 import (
 	"fmt"
@@ -23,6 +23,9 @@ import (
 	"math/rand"
 	"testing"
 	"time"
+
+	. "agilelimiter"
+	"agilelimiter/internal/simhook"
 )
 
 // tamper rewrites the latencies one tick produced before the limiter sees them.
@@ -75,7 +78,7 @@ func runOutTampered(m outModel, cfg Config, tp tamper) robustRun {
 		for _, d := range obs {
 			l.Observe(d)
 		}
-		l.ctrl.step()
+		simhook.Step(l)
 		rr.tr = append(rr.tr, tickRec{sent: sent, good: sent * goodFraction(lat, m.slo)})
 		rr.rates = append(rr.rates, rate)
 		if t >= simWarm && rate > m.capacity(t) {
@@ -347,8 +350,8 @@ func TestRobustGarbageNeverEscapes(t *testing.T) {
 					c.Observe(d)
 				}
 			}
-			l.ctrl.step()
-			c.ctrl.step()
+			simhook.Step(l)
+			simhook.Step(c)
 			for _, s := range []Stats{l.Stats(), c.Stats()} {
 				if s.Rate < probe || s.Rate > max || math.IsNaN(s.Rate) {
 					t.Fatalf("tol=%v tick %d: rate %v escaped [%d, %d]", tol, i, s.Rate, probe, max)
@@ -440,7 +443,7 @@ func runInTampered(m inModel, cfg ConcurrencyConfig, tp tamper) trace {
 		for _, d := range obs {
 			l.Observe(d)
 		}
-		l.ctrl.step()
+		simhook.Step(l)
 		tr = append(tr, tickRec{sent: done, good: done * goodFraction(lat, m.slo)})
 	}
 	return tr

@@ -28,6 +28,7 @@ downstream RTT ──> histogram (p50/p99) ──> p50 vs slow baseline ──> 
 | `limiter_test.go` | Deterministic tests (virtual clock). |
 | `concurrency_test.go` | Deterministic tests for the concurrency limiter. |
 | `httpserver/httpserver_test.go` | `httptest`-based tests for the middleware. |
+| `sim/` | Virtual-clock simulations: vs a fixed rate, interference, real verdicts, a realistic incident timeline. |
 | `example/main.go` | Runnable demo: a downstream whose capacity changes over time. |
 | `example/concurrency/main.go` | Runnable demo: inbound concurrency limiting. |
 | `example/httpserver/main.go` | Runnable demo: an HTTP service shedding load under a swarm. |
@@ -77,7 +78,7 @@ are the *scale* of the control law, and moving them silently re-tunes every gain
 they stay available for anyone who has read `docs/design.md`.
 
 Why the default is what it is, measured in the virtual-clock simulations
-(`go test -run '^TestRealistic' -v .`: a 150-minute incident timeline with
+(`go test -run '^TestRealistic' -v ./sim`: a 150-minute incident timeline with
 heavy-tailed endpoint mixes, retries, cache hits, 4xx and 5xx):
 
 | | `PresetNone` (default) | `PresetBalanced` (old default) | fixed rate tuned for the normal peak |
@@ -766,6 +767,16 @@ deterministic:
 go test ./...
 go vet ./...
 gofmt -l .
+```
+
+The unit tests sit next to the code they test, because they reach into it. The
+simulations — fixed rate vs adaptive, interference, traffic classified by the real
+verdicts, and a realistic incident timeline — live in `sim/` and print their tables
+with `-v`; the long ones skip under `-short`:
+
+```
+go test -short ./...                         # unit tests and the quick simulations
+go test -run '^TestRealistic' -v ./sim       # one simulation, with its tables
 ```
 
 A runnable end-to-end demo lives in `example/`:

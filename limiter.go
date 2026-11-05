@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"sync"
 	"time"
+
+	"agilelimiter/internal/simhook"
 )
 
 // Anchor selects what the congestion threshold is measured against.
@@ -685,6 +687,19 @@ func (l *Limiter) Start() {
 func (l *Limiter) Stop() {
 	l.stopOnce.Do(func() { close(l.stop) })
 	l.wg.Wait()
+}
+
+// The simulations in agilelimiter/sim run the loop tick by tick instead of
+// on Start's ticker.
+func init() {
+	simhook.Step = func(limiter any) {
+		switch l := limiter.(type) {
+		case *Limiter:
+			l.ctrl.step()
+		case *ConcurrencyLimiter:
+			l.ctrl.step()
+		}
+	}
 }
 
 // Resolved is a printable snapshot of the configuration a limiter is actually

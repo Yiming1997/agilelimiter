@@ -339,7 +339,7 @@ baseline 20ms, SLO 200ms  ->  high = min(40ms, 160ms) = 40ms
 `PresetLatencyFirst` 再加 `TailTolerance = 0.05`；没配 `SLOTarget` 时仍是相对锚点。
 命名预设的含义一律不变，`PresetBalanced` 就是旧默认值，想固定旧行为就指定它。
 
-依据是真实流量仿真（`TestRealistic*`：多接口混合、重尾延迟、重试、缓存命中、
+依据是真实流量仿真（`sim/realistic_test.go`：多接口混合、重尾延迟、重试、缓存命中、
 4xx/5xx、150 分钟事故时间线）里，旧默认的三个问题都出在“相对基线”和“单拍 p99”上：
 
 | 问题 | 原因 | 新默认 |

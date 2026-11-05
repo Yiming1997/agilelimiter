@@ -1,11 +1,11 @@
-package agilelimiter_test
+package sim
 
 // Realistic traffic: endpoint mixes with heavy-tailed latency, every kind of
 // fast answer and error a production service sees, and a 150-minute timeline
 // of the incidents a limiter exists for.
 //
 // Every call goes through the real verdicts and the adapters' routing (see
-// filtered_traffic_test.go). The arms differ only in what decides the rate:
+// filtered_test.go). The arms differ only in what decides the rate:
 // nothing, a fixed rate tuned for the normal peak (go.uber.org/ratelimit), or
 // agilelimiter in three configurations.
 //
@@ -15,7 +15,7 @@ package agilelimiter_test
 // and climbs steeply near saturation, and overload leaves a backlog that later
 // ticks inherit.
 //
-//	go test -run '^TestRealistic' -v .
+//	go test -run '^TestRealistic' -v ./sim
 
 import (
 	"context"
@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"agilelimiter"
+	"agilelimiter/internal/simhook"
 )
 
 const (
@@ -389,7 +390,7 @@ func runRealOutbound(arm rtArm, world []outWorld) []rtScore {
 			}
 		}
 		if lim != nil {
-			agilelimiter.Step(lim)
+			simhook.Step(lim)
 			sc.end = lim.Stats()
 			if sc.end.Rate < 0.99*rate {
 				backoffCause(sc, unreachable, reached, sc.end, arm.out.TailTolerance, outSLO)
@@ -642,7 +643,7 @@ func runRealInbound(arm rtArm, world []inWorld) []rtScore {
 				}
 			}
 			before := lim.Stats().Rate
-			agilelimiter.StepConcurrency(lim)
+			simhook.Step(lim)
 			sc.end = lim.Stats()
 			if sc.end.Rate < 0.99*before {
 				backoffCause(sc, unreachable, reached, sc.end, arm.in.TailTolerance, inSLO)

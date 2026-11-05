@@ -1,4 +1,4 @@
-package agilelimiter_test
+package sim
 
 // Robustness with the traffic filtered the way the README says to: the HTTP
 // adapters' DefaultVerdict drops tagged cache hits, refused connections and
@@ -13,7 +13,7 @@ package agilelimiter_test
 // time is simulated — the adapters time a call with time.Now, so the duration a
 // call would have measured is generated instead of slept.
 //
-//	go test -run '^TestFiltered' -v .
+//	go test -run '^TestFiltered' -v ./sim
 
 import (
 	"context"
@@ -32,6 +32,7 @@ import (
 	"agilelimiter"
 	"agilelimiter/httpclient"
 	"agilelimiter/httpserver"
+	"agilelimiter/internal/simhook"
 )
 
 const (
@@ -191,7 +192,7 @@ func runClient(cfg agilelimiter.Config, mixes []clientMix, dur time.Duration) ft
 		for _, e := range ev {
 			routeClient(lim, e.client, e.d)
 		}
-		agilelimiter.Step(lim)
+		simhook.Step(lim)
 
 		if t >= ftWarm {
 			res.good += originCalls * ftGoodFraction(lat, slo)
@@ -411,7 +412,7 @@ func runServer(cfg agilelimiter.ConcurrencyConfig, mixes []serverMix, dur time.D
 		for _, e := range ev {
 			routeServer(lim, e.server, e.d)
 		}
-		agilelimiter.StepConcurrency(lim)
+		simhook.Step(lim)
 
 		if t >= ftWarm {
 			res.good += work * ftGoodFraction(lat, cfg.SLOTarget)

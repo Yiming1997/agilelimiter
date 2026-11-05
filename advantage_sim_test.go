@@ -190,9 +190,10 @@ type outArm struct {
 }
 
 var outArms = []outArm{
-	{"agile default(2x)", PresetNone},
+	{"agile balanced(2x)", PresetBalanced},
 	{"agile latency-first", PresetLatencyFirst},
 	{"agile throughput-first", PresetThroughputFirst},
+	{"agile default", PresetNone}, // with an SLO: the SLO anchor and a 5% tail tolerance
 }
 
 // simOutCfg is the configuration under test: library defaults (1s tick, 45s
@@ -265,17 +266,22 @@ func TestAdvantageEstimateError(t *testing.T) {
 		best, bestGood := bestOutFixed(m, simWarm, m.dur)
 		safe, safeGood := bestOutFixedOK(m, simWarm, m.dur, 99)
 
-		loose := runOutAdaptive(m, simOutCfg(ds.slo, PresetNone, 600))
+		loose := runOutAdaptive(m, simOutCfg(ds.slo, PresetBalanced, 600))
 		looseGood, _, looseOK := loose.score(simWarm, m.dur)
+		// The default aims at 0.8 x SLOTarget and tolerates 5% of the traffic
+		// above it: more goodput, a few points less inside the SLO.
+		dflt, _, dfltOK := runOutAdaptive(m, simOutCfg(ds.slo, PresetNone, 600)).score(simWarm, m.dur)
 
-		tb := newTable("estimate error", "uber rate", "uber good/s", "uber ok", "agile(Max=guess)", "agile(Max=600)")
+		tb := newTable("estimate error", "uber rate", "uber good/s", "uber ok",
+			"balanced(Max=guess)", "balanced(Max=600)", "default(Max=600)")
 		for _, e := range []float64{-0.5, -0.3, -0.2, -0.1, -0.05, 0, 0.05, 0.1, 0.2, 0.5} {
 			guess := best * (1 + e)
 			ug, _, uok := runOutFixed(m, guess).score(simWarm, m.dur)
-			capped := runOutAdaptive(m, simOutCfg(ds.slo, PresetNone, int(math.Round(guess))))
+			capped := runOutAdaptive(m, simOutCfg(ds.slo, PresetBalanced, int(math.Round(guess))))
 			cg, _, cok := capped.score(simWarm, m.dur)
 			tb.row(fmt.Sprintf("%+.0f%%", e*100), f0(guess), f1(ug), pct(uok),
-				fmt.Sprintf("%s (%s)", f1(cg), pct(cok)), fmt.Sprintf("%s (%s)", f1(looseGood), pct(looseOK)))
+				fmt.Sprintf("%s (%s)", f1(cg), pct(cok)), fmt.Sprintf("%s (%s)", f1(looseGood), pct(looseOK)),
+				fmt.Sprintf("%s (%s)", f1(dflt), pct(dfltOK)))
 
 			// Whatever the guess, a ceiling must not cost the SLO.
 			if cok < 97 {
@@ -304,7 +310,7 @@ func TestAdvantageStep(t *testing.T) {
 	change := simWarm + 120*time.Second
 	dur := change + 300*time.Second
 
-	tb := newTable("capacity", "uber(before)", "uber(worst)", "oracle fixed", "agile 2x", "agile slo", "agile tput", "agile recover")
+	tb := newTable("capacity", "uber(before)", "uber(worst)", "oracle fixed", "agile balanced", "agile slo", "agile tput", "agile default", "agile recover")
 	for _, step := range []struct{ from, to float64 }{
 		{150, 135}, {150, 105}, {150, 75}, {150, 45}, {150, 15},
 		{45, 150}, {75, 150},
@@ -332,14 +338,14 @@ func TestAdvantageStep(t *testing.T) {
 		var defaultTrace trace
 		for _, a := range outArms {
 			tr := runOutAdaptive(m, simOutCfg(slo, a.preset, 600))
-			if a.preset == PresetNone {
+			if a.preset == PresetBalanced {
 				defaultTrace = tr
 			}
 			g, _, ok := tr.score(simWarm, dur)
 			cells = append(cells, fmt.Sprintf("%s (%s)", f1(g), pct(ok)))
 		}
 		settled := runOutAdaptive(outModel{base: constBase(base), capacity: constCap(step.to), slo: slo, dur: simWarm + 300*time.Second},
-			simOutCfg(slo, PresetNone, 600)).goodput(simWarm, simWarm+300*time.Second)
+			simOutCfg(slo, PresetBalanced, 600)).goodput(simWarm, simWarm+300*time.Second)
 		cells = append(cells, recoverTime(defaultTrace, change, settled))
 		tb.row(cells...)
 
@@ -386,7 +392,7 @@ func TestAdvantageDrift(t *testing.T) {
 	const base, slo = 20 * time.Millisecond, 100 * time.Millisecond
 	mean := staticOutRate(base, slo, 150)
 
-	tb := newTable("amp", "period", "uber(mean)", "uber(trough)", "oracle fixed", "agile 2x", "agile slo", "agile tput", "best agile/oracle")
+	tb := newTable("amp", "period", "uber(mean)", "uber(trough)", "oracle fixed", "agile balanced", "agile slo", "agile tput", "agile default", "best agile/oracle")
 	for _, a := range []float64{0.1, 0.3, 0.5} {
 		trough := staticOutRate(base, slo, 150*(1-a))
 		for _, p := range []time.Duration{10 * time.Second, 30 * time.Second, 60 * time.Second, 120 * time.Second, 300 * time.Second, 900 * time.Second} {
@@ -413,7 +419,7 @@ func TestAdvantageDrift(t *testing.T) {
 				g, _, ok := runOutAdaptive(m, simOutCfg(slo, arm.preset, 600)).score(simWarm, m.dur)
 				bestAgile = math.Max(bestAgile, g)
 				cells = append(cells, fmt.Sprintf("%s (%s)", f0(g), pct(ok)))
-				if arm.preset == PresetNone && a >= 0.3 && p >= time.Minute && g < oracle {
+				if arm.preset == PresetBalanced && a >= 0.3 && p >= time.Minute && g < oracle {
 					t.Errorf("drift ±%.0f%% over %v: agile %.1f good/s did not beat the best fixed rate in hindsight (%.1f)",
 						a*100, p, g, oracle)
 				}
@@ -436,7 +442,7 @@ func TestAdvantageBenignRise(t *testing.T) {
 	change := simWarm + 120*time.Second
 	dur := change + 300*time.Second
 
-	tb := newTable("base", "uber(before)", "uber(after)", "oracle fixed", "agile 2x", "agile slo", "agile tput")
+	tb := newTable("base", "uber(before)", "uber(after)", "oracle fixed", "agile balanced", "agile slo", "agile tput", "agile default")
 	for _, rise := range []struct{ from, to time.Duration }{
 		{20 * time.Millisecond, 40 * time.Millisecond},
 		{20 * time.Millisecond, 60 * time.Millisecond},
@@ -549,7 +555,7 @@ func TestAdvantageInbound(t *testing.T) {
 	steadyModel := inModel{base: base, par: func(time.Duration) float64 { return par }, slo: slo, clients: 1200, dur: simWarm + 60*time.Second}
 	healthy, _ := bestInFixed(steadyModel, simWarm, steadyModel.dur)
 
-	tb := newTable("scenario", "uber(0.9x)", "uber(1.0x)", "uber(1.1x)", "oracle fixed", "agile 2x", "agile slo", "agile tput")
+	tb := newTable("scenario", "uber(0.9x)", "uber(1.0x)", "uber(1.1x)", "oracle fixed", "agile balanced", "agile slo", "agile tput", "agile default")
 	for _, sc := range []struct {
 		name string
 		par  func(time.Duration) float64
@@ -591,7 +597,7 @@ func TestAdvantageInbound(t *testing.T) {
 		var agile float64
 		for _, arm := range outArms {
 			g, _, ok := runInAdaptive(m, simInCfg(slo, arm.preset)).score(simWarm, dur)
-			if arm.preset == PresetNone {
+			if arm.preset == PresetBalanced {
 				agile = g
 			}
 			cells = append(cells, fmt.Sprintf("%s (%s)", f0(g), pct(ok)))

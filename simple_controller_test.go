@@ -71,6 +71,7 @@ func TestSimpleControllerTailGuard(t *testing.T) {
 		MaxRate:     1000,
 		InitialRate: 100,
 		SLOTarget:   50 * time.Millisecond,
+		Preset:      PresetBalanced, // the per-tick p99 guard
 	})
 	for i := 0; i < 3; i++ {
 		feedMixed(l)

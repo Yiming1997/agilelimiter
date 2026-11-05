@@ -414,10 +414,10 @@ func TestRealisticOutbound(t *testing.T) {
 		// The normal peak is 360 calls/s; 380 keeps the origin near 80% busy at
 		// the usual hit ratio — what a load test would have picked.
 		{name: "uber(380)", fixed: 380},
-		{name: "agile default", out: cfg(agilelimiter.PresetNone, 0)},
+		{name: "agile balanced", out: cfg(agilelimiter.PresetBalanced, 0)},
 		{name: "agile latency-first", out: cfg(agilelimiter.PresetLatencyFirst, 0)},
-		{name: "agile TailTolerance 5%", out: cfg(agilelimiter.PresetNone, 0.05)},
-		{name: "agile latency-first+Tol 5%", out: cfg(agilelimiter.PresetLatencyFirst, 0.05)},
+		{name: "agile balanced+Tol 5%", out: cfg(agilelimiter.PresetBalanced, 0.05)},
+		{name: "agile default", out: cfg(agilelimiter.PresetNone, 0)},
 	}
 	world := outTimeline()
 	scores := make([][]rtScore, len(arms))
@@ -666,10 +666,10 @@ func TestRealisticInbound(t *testing.T) {
 		{name: "no limiter", fixed: rtNoLimit},
 		// The normal peak is 1100 users/s plus scanners; 1200 admits all of it.
 		{name: "uber(1200)", fixed: 1200},
-		{name: "agile default", in: cfg(agilelimiter.PresetNone, 0)},
+		{name: "agile balanced", in: cfg(agilelimiter.PresetBalanced, 0)},
 		{name: "agile latency-first", in: cfg(agilelimiter.PresetLatencyFirst, 0)},
-		{name: "agile TailTolerance 5%", in: cfg(agilelimiter.PresetNone, 0.05)},
-		{name: "agile latency-first+Tol 5%", in: cfg(agilelimiter.PresetLatencyFirst, 0.05)},
+		{name: "agile balanced+Tol 5%", in: cfg(agilelimiter.PresetBalanced, 0.05)},
+		{name: "agile default", in: cfg(agilelimiter.PresetNone, 0)},
 	}
 	world := inTimeline()
 	scores := make([][]rtScore, len(arms))

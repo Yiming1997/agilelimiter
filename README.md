@@ -36,15 +36,15 @@ downstream RTT ──> histogram (p50/p99) ──> p50 vs slow baseline ──> 
 ## Usage
 
 Two things are yours to decide: how much you are willing to promise, and how slow
-is still acceptable. Everything else is policy, and policy comes from a preset.
+is still acceptable. Everything else is policy, and with an `SLOTarget` the default
+policy is the recommended one.
 
 ```go
 cfg := agilelimiter.Config{
 	MaxRate:   500,                     // the ceiling you promise the downstream
 	FloorRate: 250,                     // normal floor: near your safe static rate
 	ProbeRate: 10,                      // outage floor: low enough to keep probing
-	SLOTarget: 200 * time.Millisecond,  // the red line
-	Preset:    agilelimiter.PresetLatencyFirst,
+	SLOTarget: 200 * time.Millisecond,  // the red line — and the anchor
 }
 if err := cfg.Validate(); err != nil { // optional; do it in tests
 	log.Fatal(err)
@@ -62,16 +62,37 @@ log.Printf("limiter: %+v", lim.Config()) // what it actually resolved to
 err := lim.Do(func() error { return doRequest(ctx) })
 ```
 
-| Preset | Threshold | A step needs | Use it when |
-|---|---|---|---|
-| `PresetNone` (zero) / `PresetBalanced` | 2x baseline | 1 tick | default; protects the knee |
-| `PresetLatencyFirst` | `0.8 x SLOTarget` | 2 ticks | the SLO is a contract |
-| `PresetThroughputFirst` | 3.5x baseline | 2 ticks | downstream degrades gracefully; set `MaxRate` to the knee |
+| Preset | Threshold | A step needs | Tail guard | Use it when |
+|---|---|---|---|---|
+| `PresetNone` (zero), with `SLOTarget` | `0.8 x SLOTarget` | 2 ticks | 5% of the traffic above the SLO, +3σ | the default: production traffic, heavy tails, several endpoints |
+| `PresetNone` (zero), no `SLOTarget` | 2x baseline | 1 tick | none | there is no SLO to anchor to |
+| `PresetBalanced` | 2x baseline | 1 tick | per-tick p99 above the SLO | the downstream has a knee below its SLO; the previous default |
+| `PresetLatencyFirst` | `0.8 x SLOTarget` | 2 ticks | per-tick p99 above the SLO | the SLO is a contract and the tail is homogeneous |
+| `PresetThroughputFirst` | 3.5x baseline | 2 ticks | per-tick p99 above the SLO | downstream degrades gracefully; set `MaxRate` to the knee |
 
 A preset only fills the fields you left at zero, so an explicit setting always
-wins. No preset touches `Tick` or the half-lives: those are the *scale* of the
-control law, and moving them silently re-tunes every gain — they stay available
-for anyone who has read `docs/design.md`.
+wins. The named presets are fixed definitions you can pin; `PresetNone` follows
+the library's recommendation. No preset touches `Tick` or the half-lives: those
+are the *scale* of the control law, and moving them silently re-tunes every gain —
+they stay available for anyone who has read `docs/design.md`.
+
+Why the default is what it is, measured in the virtual-clock simulations
+(`go test -run '^TestRealistic' -v .`: a 150-minute incident timeline with
+heavy-tailed endpoint mixes, retries, cache hits, 4xx and 5xx):
+
+| | `PresetNone` (default) | `PresetBalanced` (old default) | fixed rate tuned for the normal peak |
+|---|---:|---:|---:|
+| goodput, outbound / inbound | 281 / 820 | 256 / 707 | 282 / 841 |
+| seconds past saturation, outbound / inbound | 320 / 34 | 7 / 8 | 1214 / 829 |
+| calls held back in normal hours | 0-2% | 6-25% | — |
+| recovery after a burst of fast samples | 0s | minutes to half an hour | — |
+
+What it gives up: it runs closer to the SLO — the 5% tolerance plus its margin
+lets roughly 4-13% of requests past it on a clean downstream, against ~1% for the
+p99 guard — and it protects less tightly. And the ratio guard is *diluted* by
+answers that should never have been observed: with 95% of the stream untagged
+cache hits, the real requests are 5% of it and the guard cannot see them. Tag
+your fast answers (see the verdicts below); pin `PresetBalanced` if you cannot.
 
 That is nearly the whole surface. Five fields are the configuration for most
 services; everything else lives in `Config` under banners that say what it costs
@@ -83,8 +104,8 @@ to move:
 | `FloorRate` | normal floor: the static rate you trust in the worst healthy case |
 | `ProbeRate` | outage floor: the low rate used while calls never reach the downstream |
 | `SLOTarget` | the red line — also enables the tail guard and the SLO anchor |
-| `Preset` | picks the policy: anchor, hysteresis, tolerated multiple |
-| `TailTolerance` | optional, set once: your tail is made of different request types |
+| `Preset` | picks the policy: anchor, hysteresis, tolerated multiple, tail test |
+| `TailTolerance` | optional: the share of traffic allowed above the SLO (default 5% with an SLO) |
 | `Classify` | correctness rather than tuning: which failures never reached the downstream |
 
 `MinRate` is kept as a compatibility fallback: if `FloorRate` or `ProbeRate` is
@@ -328,15 +349,16 @@ additive; `docs/design.md` §9.6 has the numbers and the reasoning.
 `Config.Anchor` decides the threshold, and it changes what the controller
 optimizes:
 
-| | `AnchorBaseline` (default) | `AnchorSLO` |
+| | `AnchorBaseline` | `AnchorSLO` |
 |---|---|---|
+| Who gets it | no `SLOTarget`, or `PresetBalanced` / `PresetThroughputFirst` | the default with an `SLOTarget`, and `PresetLatencyFirst` |
 | Threshold | `(1+TargetInflation) x baseline`, capped at `0.8 x SLOTarget` | `0.8 x SLOTarget`, flat |
 | Optimizing for | the latency knee | goodput subject to the SLO |
 | A benign rise | backs off: 20ms -> 50ms is 2.5x the baseline | nothing, while it stays under the threshold |
 | `SLOTarget` | optional | required — falls back to `AnchorBaseline` without one |
 
-The default protects the knee, and that is the right default for a downstream
-that has one. But the SLO cap is one-way: `min()` can only *lower* the window,
+The relative anchor protects the knee, and that is the right choice for a
+downstream that has one. But the SLO cap is one-way: `min()` can only *lower* the window,
 never raise it, so with a small baseline the SLO contributes nothing and the
 effective target is "2x the fastest response ever observed", whatever the SLO
 allows:
@@ -348,9 +370,14 @@ allows:
 A healthy-but-slower 50ms period is 2.5x that baseline, so the rate walks down
 to `MinRate` and stays: the baseline may only climb `MaxBaselineRise` per tick
 (~12%/min at the defaults) and the ramp back is `UpStep` per tick. On a virtual
-clock that is 500 -> 10 req/s in 26 ticks, and 88 ticks to return
+clock that is 500 -> 10 req/s in 11 ticks, and 218 ticks to return
 (`TestBaselineAnchorCollapsesOnBenignRise`). `AnchorSLO` reads 50ms against a
-160ms threshold and does not move (`TestSLOAnchorIgnoresBenignRise`).
+160ms threshold and does not move (`TestSLOAnchorIgnoresBenignRise`). The same
+drag works with no rise at all: anything that makes the median briefly fast — a
+scanner's 404s, health checks nobody excluded, a timer that was never started —
+pulls the baseline down within a minute, and the real latency then reads as
+congestion for most of an hour. That is why the default uses the SLO anchor
+whenever there is an SLO.
 
 What it costs: the absolute controller keeps probing while the SLO has headroom,
 so it will not find a knee that sits below the SLO. If your downstream degrades
@@ -364,7 +391,7 @@ TestSLOAnchorVsUber -v`), 20s runs, a downstream that answers 20ms and then
 | | achieved/s | goodput/s | %<=SLO | final rate |
 |---|---:|---:|---:|---:|
 | `uber(100)` fixed rate | 102 | 102 | 100% | 100 |
-| `AnchorBaseline`, 2x (default) | 48 | 48 | 100% | **5** |
+| `AnchorBaseline`, 2x (`PresetBalanced`) | 48 | 48 | 100% | **5** |
 | `AnchorBaseline`, 3.5x | 99 | 99 | 100% | 112 |
 | `AnchorSLO` | 99 | 99 | 100% | 109 |
 
@@ -660,7 +687,8 @@ request types rather than of queueing: `SLOTarget` stays the number in the
 contract, the window cap and the `AnchorSLO` target stay where they are, and only
 the guard gets room.
 
-`TailTolerance` (default 0 — off) changes the guard's *statistic* instead: it fires
+`TailTolerance` (0.05 by default with an `SLOTarget`; 0 — the p99 test — under
+every named preset) changes the guard's *statistic*: it fires
 when the smoothed **fraction of the tick above the target** exceeds the tolerance
 by more than three standard errors. The caller supplies the policy (how much slow
 traffic is acceptable) and the controller supplies the evidence bar, derived from

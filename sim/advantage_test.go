@@ -1,4 +1,4 @@
-package agilelimiter
+package sim
 
 // Advantage map: where does the adaptive limiter beat a fixed-rate limiter
 // (go.uber.org/ratelimit), and where does it lose?
@@ -33,7 +33,7 @@ package agilelimiter
 //
 // Print the tables with:
 //
-//	go test -run '^TestAdvantage' -v .
+//	go test -run '^TestAdvantage' -v ./sim
 
 import (
 	"fmt"
@@ -42,6 +42,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	. "agilelimiter"
+	"agilelimiter/internal/simhook"
 )
 
 const (
@@ -150,7 +153,7 @@ func runOutAdaptive(m outModel, cfg Config) trace {
 		n := int(carry)
 		carry -= float64(n)
 		feedJittered(l.Observe, rng, lat, n)
-		l.ctrl.step()
+		simhook.Step(l)
 		tr = append(tr, tickRec{sent: sent, good: sent * goodFraction(lat, m.slo)})
 	}
 	return tr
@@ -521,7 +524,7 @@ func runInAdaptive(m inModel, cfg ConcurrencyConfig) trace {
 		lat := b * math.Max(1, inflight/par)
 		done := inflight / lat * simDt.Seconds()
 		feedJittered(l.Observe, rng, lat, int(done))
-		l.ctrl.step()
+		simhook.Step(l)
 		tr = append(tr, tickRec{sent: done, good: done * goodFraction(lat, m.slo)})
 	}
 	return tr

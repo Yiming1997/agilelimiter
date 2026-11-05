@@ -2,15 +2,16 @@ package agilelimiter
 
 // Refused connections and the synthetic outage sample.
 //
-// Unavailable() records a synthetic "congested" sample so a refused connection
-// does not read as a fast, healthy response. The sample is a made-up number, not
-// a measurement, so how MANY of them a tick records carries no information — but
-// it used to scale with the number of failed calls, which let the ratio-mode
+// Unavailable() counts a call that never arrived, so a refused connection does
+// not read as a fast, healthy response; a tick those calls dominate is an outage
+// and records one synthetic "congested" sample. The sample is a made-up number,
+// not a measurement, so how MANY of them a tick records carries no information —
+// but it used to scale with the number of failed calls, which let the ratio-mode
 // tail guard read "10% of calls were refused" as "10% of the traffic was slow".
 // Above the default 5% tolerance, the guard fired every tick and pinned the rate
-// to the floor. These tests pin both halves of the contract: rate-limited
-// refusal volume must not collapse the limiter, and a total outage must still
-// back it off.
+// to the floor. These tests pin both halves of the contract: refusal volume that
+// does not dominate must not collapse the limiter, in either tail mode, and an
+// outage must still back it off.
 
 import (
 	"fmt"
@@ -44,6 +45,11 @@ func refCfg() Config {
 // calls are refused. Every k-th call is a refusal, which is deterministic and
 // therefore reproducible (a random draw made the earlier diagnostic flaky).
 func driveRefused(cfg Config, pct int) (settled, goodput, minRate float64) {
+	return driveRefusedOn(cfg, pct, refCap)
+}
+
+// driveRefusedOn is driveRefused against a plant of the given capacity.
+func driveRefusedOn(cfg Config, pct int, refCap float64) (settled, goodput, minRate float64) {
 	l := New(cfg)
 	var good, att float64
 	minRate = math.Inf(1)
@@ -100,6 +106,50 @@ func TestRefusedVolumeDoesNotCollapse(t *testing.T) {
 		if good < 0.9*cleanGood {
 			t.Errorf("%d%% refused goodput %.0f, want >= %.0f (clean %.0f)",
 				pct, good, 0.9*cleanGood, cleanGood)
+		}
+	}
+}
+
+// The same contract in quantile mode at low volume. With fewer than 100 samples a
+// tick the nearest-rank p99 is the tick's maximum, so a synthetic sample — above
+// SLOTarget by construction — is the p99 whenever one is recorded. Recording one
+// for any tick that saw a refusal made a single refused call fire the tail guard.
+func TestSporadicRefusalsDoNotFireQuantileGuard(t *testing.T) {
+	cfg := refCfg()
+	cfg.TailTolerance = 0 // quantile mode, the default
+	const capacity = 100  // settles near 70 req/s: under 100 samples a tick
+	clean, _, _ := driveRefusedOn(cfg, 0, capacity)
+	if clean >= 100 {
+		t.Fatalf("clean run settled at %.0f; the test needs fewer than 100 samples a tick", clean)
+	}
+	for _, pct := range []int{1, 2, 5, 10, 20} {
+		if settled, _, _ := driveRefusedOn(cfg, pct, capacity); settled < 0.9*clean {
+			t.Errorf("%d%% refused settled at %.0f, want >= %.0f (clean %.0f)", pct, settled, 0.9*clean, clean)
+		}
+	}
+}
+
+// When most of a tick's calls never arrive, that tick is an outage, whatever the
+// volume: the limiter must back off toward ProbeRate even though some calls
+// still get through.
+func TestMajorityRefusedBacksOff(t *testing.T) {
+	for _, tol := range []float64{0, 0.05} {
+		cfg := refCfg()
+		cfg.TailTolerance = tol
+		cfg.InitialRate = 60
+		l := New(cfg)
+		for i := 0; i < 40; i++ {
+			for k, n := 0, int(math.Max(1, l.Rate())); k < n; k++ {
+				if k%5 == 0 {
+					l.Observe(time.Duration(refBaseMS * 1e6))
+				} else {
+					l.Unavailable() // 80% refused
+				}
+			}
+			l.ctrl.step()
+		}
+		if got := l.Rate(); got > float64(cfg.ProbeRate)+1 {
+			t.Errorf("tol=%v: 80%% refused settled at %.0f, want ProbeRate=%d", tol, got, cfg.ProbeRate)
 		}
 	}
 }

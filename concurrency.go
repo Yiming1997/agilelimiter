@@ -243,21 +243,19 @@ func (l *ConcurrencyLimiter) observeOutcome(d time.Duration, err error) {
 // breaker is open, a request is rejected before touching the hot path. Record it
 // instead of Observe for that request: its handling time is ~0 and would read as
 // a fast, healthy service, so the controller would raise the limit while the
-// service is struggling. It feeds a synthetic "congested" sample that backs the
-// limit off toward MinLimit.
+// service is struggling. A tick in which these requests outnumber the observed
+// ones two to one backs the limit off one step toward ProbeLimit; a tick with
+// fewer only lets the floor fall to ProbeLimit until the next observed request
+// (see Limiter.Unavailable).
 //
-// It is a no-op before the controller has anything to anchor a synthetic value
-// against: with no SLOTarget and no samples yet there is no honest number to
-// record, and inventing one would corrupt the baseline.
+// An outage tick backs off only once the controller has something to anchor a
+// synthetic sample against: with no SLOTarget and no samples yet there is no
+// honest number to record, and inventing one would corrupt the baseline.
 //
 // Use this from the manual TryTake/Observe path, or return Unreachable from
 // Config.Classify to have Do call it for you. Never do both for the same
 // request.
-func (l *ConcurrencyLimiter) Unavailable() {
-	if s, ok := l.ctrl.outageSample(); ok {
-		l.hist.record(s)
-	}
-}
+func (l *ConcurrencyLimiter) Unavailable() { l.ctrl.noteUnreachable() }
 
 // ObserveOutcome records how one request ended, applying Config.Classify to the
 // error. Use it from an integration that admits, times and classifies requests

@@ -103,9 +103,13 @@ func (t *transport) RoundTrip(req *http.Request) (*http.Response, error) {
 
 	// A canceled round trip is a truncated measurement, not a fast response: the
 	// call stopped because the caller gave up, not because the downstream was
-	// quick. That is a fact about the measurement rather than a policy choice, so
-	// it is enforced here — replacing the verdict cannot reintroduce the bug.
+	// quick, so d is only a lower bound. ObserveTruncated keeps it when that
+	// bound is already past the SLO, which is evidence of a slow downstream
+	// however the call would have ended. That is a fact about the measurement
+	// rather than a policy choice, so it is enforced here — replacing the
+	// verdict cannot change it.
 	if errors.Is(err, context.Canceled) {
+		t.lim.ObserveTruncated(d)
 		return resp, err
 	}
 

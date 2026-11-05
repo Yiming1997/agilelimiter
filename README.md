@@ -266,7 +266,7 @@ fallback — each is a line in your function, not a release of this library.
 
 | result | answer | why |
 |---|---|---|
-| `context.Canceled` | `Aborted` | the caller gave up; the duration is truncated, not fast |
+| `context.Canceled` | `Aborted` | the caller gave up; the duration is truncated, not fast — `Wrap` still keeps it once it is past `SLOTarget` |
 | a `*net.OpError` with `Op == "dial"` | `Unreachable` | refused, DNS, no route, connect timeout: nothing was sent |
 | any other error | `Reached` | a timeout is a real signal |
 | 429, any 5xx | `Unreachable` | "do not send more" — from outside you cannot tell a bug from overload, and sending less is kind either way |
@@ -286,9 +286,15 @@ A custom verdict replaces `DefaultVerdict` entirely — `Wrap` does not consult
 `Config.Classify` (that one is for `Do`/`Do[T]`, so each call path has exactly one
 policy entry point).
 
-One thing a verdict **cannot** change: a canceled call is dropped by `Wrap` before
+One thing a verdict **cannot** change: a canceled call is handled by `Wrap` before
 the verdict runs. It is a truncated measurement, not a fast response, so a verdict
-that returns `Reached` for everything still cannot turn it into evidence.
+that returns `Reached` for everything still cannot turn it into evidence of speed.
+Its duration is a *lower bound* on the real one, though, so once it is already past
+`SLOTarget` it is evidence of slowness however the call would have ended, and
+`Wrap` records it (`ObserveTruncated`); a shorter one is dropped. Dropping all of
+them is what blinded the inbound limiter when a service got slow enough for
+clients to time out: every slow request reached it as a cancellation, the
+limiter saw no samples, and it sat at its old limit while every request failed.
 
 Two things this does **not** do:
 
@@ -556,7 +562,7 @@ type Verdict func(r *http.Request, status int, h http.Header, d time.Duration) a
 
 | Response | Treated as | Why |
 |---|---|---|
-| request context canceled | not observed | the client went away; the handler returned early because nobody is listening |
+| request context canceled | not observed, unless it already ran past `SLOTarget` | the client went away; the handler returned early because nobody is listening. Its duration is a lower bound, and past the SLO that bound is evidence: a client's timeout reaches the server as a cancellation |
 | 429, 502, 503, 504 | outage → back off | "cannot serve right now" |
 | any other 4xx (400, 401, 403, 404, …) | not observed at all | refused before the work: a scanner's 404s or a wave of 401s answer in microseconds, and enough of them drag the median — and the baseline — to ~0 |
 | 500, 501, other 5xx | a normal round trip | "your code has a bug" — backing off fixes nothing |
@@ -612,7 +618,7 @@ So it is split into three layers:
 
 | Layer | Who owns it | Can it be overridden? |
 |---|---|---|
-| **Truncated measurement** — the call was canceled, or the client disconnected | the library | **no.** A truncated sample is not a fast response, it is not a measurement at all |
+| **Truncated measurement** — the call was canceled, or the client disconnected | the library | **no.** A truncated sample is not a fast response: it is a lower bound, kept only once it is already past `SLOTarget` (`ObserveTruncated`) |
 | **Default policy** — 429/5xx, dial failures, client errors (inbound), cache hits | `DefaultVerdict`, about six lines | yes — replace it wholesale |
 | **Everything else** — health paths, 202, expensive 4xx, your own error types | you, one line each | — |
 

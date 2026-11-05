@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"agilelimiter"
+	"agilelimiter/internal/simhook"
 )
 
 func TestIsCacheHit(t *testing.T) {
@@ -349,10 +350,33 @@ func TestCanceledIsNotObservedEvenWithAPermissiveVerdict(t *testing.T) {
 	}
 }
 
-type canceledTransport struct{}
+type canceledTransport struct{ after time.Duration }
 
-func (canceledTransport) RoundTrip(*http.Request) (*http.Response, error) {
+func (c canceledTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	time.Sleep(c.after)
 	return nil, context.Canceled
+}
+
+// A call canceled only after it had run past the SLO took at least that long:
+// the lower bound is evidence of a slow downstream, and the wrapper records it.
+// A call canceled sooner says nothing and is still dropped.
+func TestSlowCanceledCallIsObserved(t *testing.T) {
+	for _, c := range []struct {
+		after time.Duration
+		want  uint64
+	}{{40 * time.Millisecond, 3}, {0, 0}} {
+		lim := agilelimiter.New(agilelimiter.Config{MaxRate: 1000, InitialRate: 1000, SLOTarget: 20 * time.Millisecond})
+		rt := Wrap(canceledTransport{after: c.after}, lim)
+		for i := 0; i < 3; i++ {
+			if _, err := rt.RoundTrip(httptest.NewRequest(http.MethodGet, "http://example.com/", nil)); !errors.Is(err, context.Canceled) {
+				t.Fatalf("error = %v, want context.Canceled", err)
+			}
+		}
+		simhook.Step(lim)
+		if s := lim.Stats(); s.Samples != c.want {
+			t.Fatalf("canceled after %v: recorded %d samples, want %d", c.after, s.Samples, c.want)
+		}
+	}
 }
 
 // A failure while opening the connection says nothing about capacity: nothing was

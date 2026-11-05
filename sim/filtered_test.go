@@ -109,9 +109,11 @@ var (
 )
 
 // routeClient is httpclient.Wrap's routing, after the round trip returned. It
-// reports what the limiter was told; a dropped call reads as Aborted.
+// reports what the limiter was told; a canceled call reads as Aborted, whether
+// or not ObserveTruncated kept it.
 func routeClient(lim *agilelimiter.Limiter, c *clientCall, d time.Duration) agilelimiter.Outcome {
 	if errors.Is(c.err, context.Canceled) {
+		lim.ObserveTruncated(d)
 		return agilelimiter.Aborted
 	}
 	out := httpclient.DefaultVerdict(c.resp, c.err, d)
@@ -342,9 +344,11 @@ func serverVerdict(r *http.Request, status int, h http.Header, d time.Duration) 
 }
 
 // routeServer is httpserver.Wrap's routing, after the handler returned. It
-// reports what the limiter was told; a dropped request reads as Aborted.
+// reports what the limiter was told; a canceled request reads as Aborted,
+// whether or not ObserveTruncated kept it.
 func routeServer(lim *agilelimiter.ConcurrencyLimiter, c *serverCall, d time.Duration) agilelimiter.Outcome {
 	if c.req.Context().Err() != nil {
+		lim.ObserveTruncated(d)
 		return agilelimiter.Aborted
 	}
 	out := serverVerdict(c.req, c.status, c.header, d)

@@ -6,9 +6,9 @@ import (
 	"time"
 )
 
-// A config with no Preset must resolve exactly as it did before presets existed,
-// and PresetBalanced must be the same thing spelled out.
-func TestPresetNoneChangesNothing(t *testing.T) {
+// Without an SLO there is nothing to anchor to: a config with no Preset is the
+// relative law, the same thing PresetBalanced spells out.
+func TestPresetNoneWithoutSLOIsBalanced(t *testing.T) {
 	none := New(Config{MaxRate: 120}).Config()
 	balanced := New(Config{MaxRate: 120, Preset: PresetBalanced}).Config()
 
@@ -16,15 +16,46 @@ func TestPresetNoneChangesNothing(t *testing.T) {
 	// and what was asked is the same law either way.
 	none.Preset, balanced.Preset = "", ""
 	if none != balanced {
-		t.Fatalf("PresetBalanced must equal PresetNone:\n none:     %+v\n balanced: %+v", none, balanced)
+		t.Fatalf("PresetBalanced must equal PresetNone without an SLO:\n none:     %+v\n balanced: %+v", none, balanced)
 	}
 	if none.Tick != time.Second ||
 		none.SlowHalfLife != 45*time.Second || none.Anchor != "baseline" ||
-		none.BackoffTicks != 1 || none.RecoverTicks != 1 {
+		none.BackoffTicks != 1 || none.RecoverTicks != 1 || none.TailTolerance != 0 {
 		t.Fatalf("shipped defaults changed: %+v", none)
 	}
 	if none.Window != "2.00x baseline" {
 		t.Fatalf("Window = %q, want the relative window", none.Window)
+	}
+}
+
+// With an SLO, a config with no Preset is the recommended law: the SLO anchor,
+// two agreeing ticks per step, and a 5% tail tolerance. PresetBalanced keeps the
+// relative law and the p99 guard for anyone who pins it.
+func TestPresetNoneWithSLOIsTheSLOAnchor(t *testing.T) {
+	r := New(Config{MaxRate: 120, SLOTarget: 100 * time.Millisecond}).Config()
+	if r.Anchor != "slo" || r.BackoffTicks != 2 || r.RecoverTicks != 2 || r.TailTolerance != 0.05 {
+		t.Fatalf("default with an SLO: %+v", r)
+	}
+	if r.Window != "80ms (0.8 x SLOTarget)" || r.Tail != "5%+3σ of requests above 100ms (1.0x SLOTarget)" {
+		t.Fatalf("Window = %q, Tail = %q", r.Window, r.Tail)
+	}
+
+	b := New(Config{MaxRate: 120, SLOTarget: 100 * time.Millisecond, Preset: PresetBalanced}).Config()
+	if b.Anchor != "baseline" || b.BackoffTicks != 1 || b.TailTolerance != 0 || b.Tail != "p99 > 100ms (1.0x SLOTarget)" {
+		t.Fatalf("PresetBalanced with an SLO must keep the relative law: %+v", b)
+	}
+
+	// The named presets keep their exact meaning: none of them picks up the
+	// tolerance.
+	lf := New(Config{MaxRate: 120, SLOTarget: 100 * time.Millisecond, Preset: PresetLatencyFirst}).Config()
+	if lf.TailTolerance != 0 {
+		t.Fatalf("PresetLatencyFirst changed: %+v", lf)
+	}
+
+	// Explicit fields still win.
+	e := New(Config{MaxRate: 120, SLOTarget: 100 * time.Millisecond, Anchor: AnchorBaseline, TailTolerance: 0.1}).Config()
+	if e.Anchor != "baseline" || e.TailTolerance != 0.1 {
+		t.Fatalf("explicit fields must win over the default: %+v", e)
 	}
 }
 
@@ -68,7 +99,7 @@ func TestPresetThroughputFirst(t *testing.T) {
 // The window description has to name the cap, because that cap is one-way and is
 // the reason an SLO can be silently ignored.
 func TestResolvedDescribesCappedWindow(t *testing.T) {
-	r := New(Config{MaxRate: 120, SLOTarget: 100 * time.Millisecond}).Config()
+	r := New(Config{MaxRate: 120, SLOTarget: 100 * time.Millisecond, Preset: PresetBalanced}).Config()
 	if r.Window != "2.00x baseline, capped at 80ms" {
 		t.Fatalf("Window = %q", r.Window)
 	}
@@ -156,6 +187,7 @@ func TestTailFactorWidensTheGuard(t *testing.T) {
 			InitialRate: 500,
 			SLOTarget:   100 * time.Millisecond,
 			TailFactor:  factor,
+			Preset:      PresetBalanced, // the per-tick p99 guard
 		})
 		for i := 0; i < 5; i++ {
 			for j := 0; j < 90; j++ {
@@ -184,7 +216,7 @@ func TestTailFactorDefaults(t *testing.T) {
 }
 
 func TestResolvedDescribesTheGuard(t *testing.T) {
-	r := New(Config{MaxRate: 120, SLOTarget: 100 * time.Millisecond, TailFactor: 2}).Config()
+	r := New(Config{MaxRate: 120, SLOTarget: 100 * time.Millisecond, TailFactor: 2, Preset: PresetBalanced}).Config()
 	if r.Tail != "p99 > 200ms (2.0x SLOTarget)" {
 		t.Fatalf("Tail = %q", r.Tail)
 	}
@@ -220,6 +252,7 @@ func TestTailToleranceIgnoresACohort(t *testing.T) {
 			InitialRate:   500,
 			SLOTarget:     100 * time.Millisecond,
 			TailTolerance: tol,
+			Preset:        PresetBalanced, // tol 0 is the p99 guard only under a named preset
 		})
 		for i := 0; i < 10; i++ {
 			for j := 0; j < 95; j++ {
@@ -279,6 +312,14 @@ func TestTailRatioReflectsThePopulation(t *testing.T) {
 
 func TestTailToleranceDefaults(t *testing.T) {
 	if got := withDefaults(Config{MinRate: 1, MaxRate: 10}).TailTolerance; got != 0 {
-		t.Fatalf("TailTolerance = %v, want 0 (quantile mode, the historical behaviour)", got)
+		t.Fatalf("TailTolerance = %v, want 0: without an SLO there is no tail guard", got)
+	}
+	if got := withDefaults(Config{MinRate: 1, MaxRate: 10, SLOTarget: time.Second}).TailTolerance; got != 0.05 {
+		t.Fatalf("TailTolerance = %v, want 0.05 under PresetNone with an SLO", got)
+	}
+	for _, p := range []Preset{PresetBalanced, PresetLatencyFirst, PresetThroughputFirst} {
+		if got := withDefaults(Config{MinRate: 1, MaxRate: 10, SLOTarget: time.Second, Preset: p}).TailTolerance; got != 0 {
+			t.Fatalf("%v: TailTolerance = %v, want 0 (quantile mode)", p, got)
+		}
 	}
 }

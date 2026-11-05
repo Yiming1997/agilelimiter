@@ -171,6 +171,7 @@ func TestControllerSLOTailGuard(t *testing.T) {
 		MaxRate:     1000,
 		InitialRate: 100,
 		SLOTarget:   50 * time.Millisecond,
+		Preset:      PresetBalanced, // the per-tick p99 guard
 	})
 	// Median latency is healthy, but 10% of requests are slow.
 	for i := 0; i < 3; i++ {

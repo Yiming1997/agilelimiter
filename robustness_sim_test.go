@@ -111,15 +111,16 @@ type robustArm struct {
 
 func (a robustArm) is(b robustArm) bool { return a.name == b.name }
 
-func armDefault(slo time.Duration) Config { return simOutCfg(slo, PresetNone, 600) }
+func armBalanced(slo time.Duration) Config { return simOutCfg(slo, PresetBalanced, 600) }
 
 var (
-	rDefault  = robustArm{"default", armDefault}
-	rTailTol  = robustArm{"TailTolerance 5%", func(slo time.Duration) Config { c := armDefault(slo); c.TailTolerance = 0.05; return c }}
+	rBalanced = robustArm{"balanced", armBalanced}
+	rDefault  = robustArm{"default", func(slo time.Duration) Config { return simOutCfg(slo, PresetNone, 600) }}
+	rTailTol  = robustArm{"balanced+Tol 5%", func(slo time.Duration) Config { c := armBalanced(slo); c.TailTolerance = 0.05; return c }}
 	rSLOAnch  = robustArm{"latency-first", func(slo time.Duration) Config { return simOutCfg(slo, PresetLatencyFirst, 600) }}
-	rNoSLO    = robustArm{"no SLOTarget", func(time.Duration) Config { return armDefault(0) }}
-	rFloor80  = robustArm{"FloorRate 80", func(slo time.Duration) Config { c := armDefault(slo); c.FloorRate = 80; return c }}
-	rBackoff2 = robustArm{"BackoffTicks 2", func(slo time.Duration) Config { c := armDefault(slo); c.BackoffTicks = 2; return c }}
+	rNoSLO    = robustArm{"no SLOTarget", func(time.Duration) Config { return armBalanced(0) }}
+	rFloor80  = robustArm{"FloorRate 80", func(slo time.Duration) Config { c := armBalanced(slo); c.FloorRate = 80; return c }}
+	rBackoff2 = robustArm{"BackoffTicks 2", func(slo time.Duration) Config { c := armBalanced(slo); c.BackoffTicks = 2; return c }}
 )
 
 const (
@@ -142,7 +143,7 @@ func cell(rr robustRun, from, to time.Duration) string {
 // will melt above ~107 req/s. Break-through means: sending more than that.
 func TestRobustFakeFast(t *testing.T) {
 	m := steadyModel(simWarm + 600*time.Second)
-	arms := []robustArm{rDefault, rTailTol, rSLOAnch, rNoSLO}
+	arms := []robustArm{rDefault, rBalanced, rTailTol, rSLOAnch, rNoSLO}
 	header := []string{"fake-fast share"}
 	for _, a := range arms {
 		header = append(header, a.name)
@@ -157,10 +158,17 @@ func TestRobustFakeFast(t *testing.T) {
 			// The p99 guard sees the real slow requests through any amount of fake
 			// fast ones, as long as more than 1% of the stream is real.
 			_, _, ok := rr.tr.score(simWarm, m.dur)
-			guarded := (a.is(rDefault) && f >= 0.6 && f <= 0.95) || (a.is(rSLOAnch) && f <= 0.95)
+			guarded := (a.is(rBalanced) && f >= 0.6 && f <= 0.95) || (a.is(rSLOAnch) && f <= 0.95)
 			if guarded && (rr.over > 0 || ok < 85) {
 				t.Errorf("%s, %.0f%% fake-fast: broke through (%d ticks above capacity, %.0f%% inside the SLO)",
 					a.name, f*100, rr.over, ok)
+			}
+			// The default's ratio guard is diluted instead: the real requests'
+			// share of the stream is what it sees, so it holds the capacity
+			// while that share is well above its 5% tolerance, and 95% fake
+			// answers leave nothing to see. Fast answers are the verdict's job.
+			if a.is(rDefault) && f <= 0.9 && rr.over > 0 {
+				t.Errorf("default, %.0f%% fake-fast: %d ticks above capacity", f*100, rr.over)
 			}
 		}
 		tb.row(cells...)
@@ -174,7 +182,7 @@ func TestRobustFakeFast(t *testing.T) {
 // throttling it anyway.
 func TestRobustFakeSlow(t *testing.T) {
 	m := steadyModel(simWarm + 600*time.Second)
-	arms := []robustArm{rDefault, rTailTol, rSLOAnch, rFloor80}
+	arms := []robustArm{rDefault, rBalanced, rTailTol, rSLOAnch, rFloor80}
 	cleanTol := runOutTampered(m, rTailTol.cfg(rSLO), nil).meanRate(simWarm, m.dur)
 	header := []string{"outlier share"}
 	for _, a := range arms {
@@ -207,14 +215,14 @@ func TestRobustFakeSlow(t *testing.T) {
 func TestRobustBaselineDragDown(t *testing.T) {
 	start := simWarm + 120*time.Second
 	after := 3600 * time.Second
-	arms := []robustArm{rDefault, rSLOAnch, rFloor80}
+	arms := []robustArm{rDefault, rBalanced, rSLOAnch, rFloor80}
 	header := []string{"burst"}
 	for _, a := range arms {
 		header = append(header, a.name, "over", "recover")
 	}
 	tb := newTable(header...)
 
-	clean := runOutTampered(steadyModel(simWarm+300*time.Second), armDefault(rSLO), nil)
+	clean := runOutTampered(steadyModel(simWarm+300*time.Second), armBalanced(rSLO), nil)
 	settled := clean.tr.goodput(simWarm, simWarm+300*time.Second)
 
 	for _, burst := range []struct {
@@ -233,7 +241,7 @@ func TestRobustBaselineDragDown(t *testing.T) {
 
 			// A partial burst leaves real samples in every tick; only the
 			// baseline-anchored window can be dragged down by it.
-			if !a.is(rDefault) && burst.share < 1 {
+			if !a.is(rBalanced) && burst.share < 1 {
 				if s := recoverSecs(rr.tr, end, settled); s < 0 || s > 5 {
 					t.Errorf("%s, %.0f%% fake-fast for %v: recovery took %ds", a.name, burst.share*100, burst.span, s)
 				}
@@ -268,14 +276,14 @@ func overIn(rr robustRun, m outModel, from, to time.Duration) int {
 func TestRobustGarbageRecovery(t *testing.T) {
 	start := simWarm + 120*time.Second
 	end := start + 10*time.Second
-	arms := []robustArm{rDefault, rSLOAnch, rFloor80}
+	arms := []robustArm{rDefault, rBalanced, rSLOAnch, rFloor80}
 	header := []string{"10s of"}
 	for _, a := range arms {
 		header = append(header, a.name, "recover")
 	}
 	tb := newTable(header...)
 
-	clean := runOutTampered(steadyModel(simWarm+300*time.Second), armDefault(rSLO), nil)
+	clean := runOutTampered(steadyModel(simWarm+300*time.Second), armBalanced(rSLO), nil)
 	settled := clean.tr.goodput(simWarm, simWarm+300*time.Second)
 
 	for _, g := range []struct {
@@ -366,7 +374,7 @@ func TestRobustGarbageNeverEscapes(t *testing.T) {
 // tolerated window rises twice as fast, so the *real* latency the controller
 // accepts rises too.
 func TestRobustCreepingOverhead(t *testing.T) {
-	arms := []robustArm{rDefault, rSLOAnch, rNoSLO}
+	arms := []robustArm{rDefault, rBalanced, rSLOAnch, rNoSLO}
 	header := []string{"overhead"}
 	for _, a := range arms {
 		header = append(header, a.name)
@@ -392,8 +400,13 @@ func TestRobustCreepingOverhead(t *testing.T) {
 			cells = append(cells, cell(rr, simWarm+ramp, m.dur)+fmt.Sprintf(" over=%d", rr.over))
 
 			// With an SLOTarget the window is capped on the *observed* latency,
-			// so overhead can only make the limiter more conservative.
-			if _, _, ok := rr.tr.score(simWarm, m.dur); !a.is(rNoSLO) && ok < 99 {
+			// so overhead can only make the limiter more conservative. The
+			// default tolerates 5% of the traffic above the SLO by design.
+			want := 99.0
+			if a.is(rDefault) {
+				want = 95
+			}
+			if _, _, ok := rr.tr.score(simWarm, m.dur); !a.is(rNoSLO) && ok < want {
 				t.Errorf("%s, overhead up to %v: only %.0f%% of real requests inside the SLO", a.name, top, ok)
 			}
 		}
@@ -446,10 +459,11 @@ func TestRobustInbound(t *testing.T) {
 		name string
 		cfg  ConcurrencyConfig
 	}
-	floor := simInCfg(slo, PresetNone)
+	floor := simInCfg(slo, PresetBalanced)
 	floor.FloorLimit = 100
 	arms := []inArm{
 		{"default", simInCfg(slo, PresetNone)},
+		{"balanced", simInCfg(slo, PresetBalanced)},
 		{"latency-first", simInCfg(slo, PresetLatencyFirst)},
 		{"FloorLimit 100", floor},
 	}
@@ -522,21 +536,21 @@ func TestRobustInbound(t *testing.T) {
 // count, and a share that drifts through the day crosses it twice.
 func TestRobustFastShareBand(t *testing.T) {
 	m := steadyModel(simWarm + 600*time.Second)
-	cleanOut := runOutTampered(m, armDefault(rSLO), nil).meanRate(simWarm, m.dur)
+	cleanOut := runOutTampered(m, armBalanced(rSLO), nil).meanRate(simWarm, m.dur)
 
 	inM := inModel{base: 150 * time.Millisecond, par: func(time.Duration) float64 { return 150 },
 		slo: 300 * time.Millisecond, clients: 1200, dur: simWarm + 600*time.Second}
-	cleanIn := runInTampered(inM, simInCfg(inM.slo, PresetNone), nil).goodput(simWarm, inM.dur)
+	cleanIn := runInTampered(inM, simInCfg(inM.slo, PresetBalanced), nil).goodput(simWarm, inM.dur)
 
 	tb := newTable("fast share", "outbound (~90 samples/tick)", "inbound (~1000 samples/tick)")
 	for _, f := range []float64{0.2, 0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6, 0.7} {
-		out := runOutTampered(m, armDefault(rSLO), replaceFrac(f, 0, m.dur, fixedSample(time.Millisecond)))
-		in := runInTampered(inM, simInCfg(inM.slo, PresetNone), replaceFrac(f, 0, inM.dur, fixedSample(100*time.Microsecond)))
+		out := runOutTampered(m, armBalanced(rSLO), replaceFrac(f, 0, m.dur, fixedSample(time.Millisecond)))
+		in := runInTampered(inM, simInCfg(inM.slo, PresetBalanced), replaceFrac(f, 0, inM.dur, fixedSample(100*time.Microsecond)))
 		tb.row(pct(f*100),
 			fmt.Sprintf("%.0f%% of clean rate", 100*out.meanRate(simWarm, m.dur)/cleanOut),
 			fmt.Sprintf("%.0f%% of clean goodput", 100*in.goodput(simWarm, inM.dur)/cleanIn))
 	}
-	t.Logf("default config; a steady share of observations is a fast population (outbound 1ms, inbound 0.1ms)%s", tb)
+	t.Logf("balanced (the relative law); a steady share of observations is a fast population (outbound 1ms, inbound 0.1ms)%s", tb)
 
 	// The share drifts 30% -> 70% -> 30% over an hour, as a cache hit ratio does.
 	const period = time.Hour
@@ -560,7 +574,8 @@ func TestRobustFastShareBand(t *testing.T) {
 		out  Config
 		in   ConcurrencyConfig
 	}{
-		{"default", armDefault(rSLO), simInCfg(inM.slo, PresetNone)},
+		{"default", simOutCfg(rSLO, PresetNone, 600), simInCfg(inM.slo, PresetNone)},
+		{"balanced", armBalanced(rSLO), simInCfg(inM.slo, PresetBalanced)},
 		{"latency-first", simOutCfg(rSLO, PresetLatencyFirst, 600), simInCfg(inM.slo, PresetLatencyFirst)},
 	} {
 		out := runOutTampered(dm, a.out, drift(time.Millisecond)).meanRate(simWarm, dm.dur)
@@ -574,7 +589,7 @@ func TestRobustFastShareBand(t *testing.T) {
 // one request in a hundred. The downstream is healthy but jittery.
 func TestRobustSparseSamples(t *testing.T) {
 	m := steadyModel(simWarm + 600*time.Second)
-	arms := []robustArm{rDefault, rBackoff2, rSLOAnch}
+	arms := []robustArm{rDefault, rBalanced, rBackoff2, rSLOAnch}
 	header := []string{"samples/tick"}
 	for _, a := range arms {
 		header = append(header, a.name)
@@ -592,7 +607,13 @@ func TestRobustSparseSamples(t *testing.T) {
 		for _, a := range arms {
 			rr := runOutTampered(m, a.cfg(rSLO), tp)
 			cells = append(cells, cell(rr, simWarm, m.dur))
-			if g, _, ok := rr.tr.score(simWarm, m.dur); g < 70 || ok < 93 {
+			// At a few samples a tick the ratio guard's 3σ margin is wide, so
+			// the default runs a little closer to the SLO.
+			want := 93.0
+			if a.is(rDefault) {
+				want = 90
+			}
+			if g, _, ok := rr.tr.score(simWarm, m.dur); g < 70 || ok < want {
 				t.Errorf("%s with %d samples/tick: %.0f good/s, %.0f%% inside the SLO", a.name, k, g, ok)
 			}
 		}

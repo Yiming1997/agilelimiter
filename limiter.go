@@ -12,8 +12,8 @@ import (
 type Anchor int
 
 const (
-	// AnchorUnset is the zero value: let Preset decide, and fall back to
-	// AnchorBaseline when there is no preset.
+	// AnchorUnset is the zero value: let Preset decide. PresetNone picks
+	// AnchorSLO when SLOTarget is set and AnchorBaseline when it is not.
 	//
 	// It exists because AnchorBaseline has to be a real, choosable value — so the
 	// zero value cannot also mean "baseline" without making "the caller did not
@@ -26,9 +26,10 @@ const (
 	// been seen to produce*. It protects the knee of the latency curve and needs
 	// no SLO, but it has no notion of how much SLO headroom is left: a downstream
 	// answering in 20ms that degrades to 50ms is 2.5x its own baseline, so the
-	// default law backs off to MinRate even though 50ms may be a quarter of the
+	// relative law backs off to MinRate even though 50ms may be a quarter of the
 	// SLO, and it then stays there for minutes (MinRate -> MaxRate at UpStep per
-	// tick). See docs/design.md §9.
+	// tick). It is the law without an SLOTarget, or with PresetBalanced. See
+	// docs/design.md §9.
 	AnchorBaseline
 
 	// AnchorSLO is the absolute controller: the backoff threshold is
@@ -60,12 +61,13 @@ type Config struct {
 	// ── what you must decide ─────────────────────────────────────────────
 
 	// Preset fills the *policy* fields you leave at zero: the anchor, the tick
-	// hysteresis, the tolerated multiple. Supply MaxRate — and, for
-	// PresetLatencyFirst, SLOTarget — and nothing else to get a tuned limiter.
+	// hysteresis, the tolerated multiple, the tail tolerance. Supply MaxRate and
+	// SLOTarget and nothing else to get the recommended limiter.
 	//
-	// Zero (PresetNone) fills nothing, so a config without a preset behaves
-	// exactly as it did before presets existed. Any field you set explicitly
-	// wins over the preset; see applyPreset for the exact table.
+	// Zero (PresetNone) is the recommendation: the SLO anchor with a 5% tail
+	// tolerance when SLOTarget is set, the relative law when it is not. Name a
+	// preset to pin a law instead. Any field you set explicitly wins over the
+	// preset; see applyPreset for the exact table.
 	Preset Preset
 
 	// MinRate is the legacy fallback for FloorRate and ProbeRate. New code
@@ -124,8 +126,9 @@ type Config struct {
 
 	// TailTolerance switches the tail guard from a quantile test to a ratio test:
 	// it fires when the smoothed fraction of requests above the tail target
-	// exceeds this number. Zero (the default) keeps the historical test, "is the
-	// per-tick p99 above the target".
+	// exceeds this number. Zero leaves it to the Preset: PresetNone with an
+	// SLOTarget uses 0.05, and every named preset keeps the quantile test, "is
+	// the per-tick p99 above the target".
 	//
 	// The ratio test exists because a quantile cannot tell a heterogeneous
 	// population from queueing: 5% of requests that are simply a different
@@ -258,19 +261,31 @@ const (
 // promise (MaxRate) and how slow is still acceptable (SLOTarget).
 //
 // A preset fills only the fields the caller left at their zero value, so any
-// explicit setting still wins. PresetNone (the zero value) fills nothing, which
-// is why adding this field changed no existing behaviour.
+// explicit setting still wins. The named presets are fixed definitions a
+// service can pin; PresetNone is the library's recommendation and follows it.
 type Preset int
 
 const (
-	// PresetNone is the zero value: fill nothing, use the library defaults.
+	// PresetNone is the zero value: the recommended law.
+	//
+	// With an SLOTarget that is the SLO anchor (0.8 x SLOTarget, two agreeing
+	// ticks per step) with a 5% tail tolerance — PresetLatencyFirst with the
+	// ratio guard. It is what held up best on traffic that looks like
+	// production: endpoints of different cost, a heavy tail, fast answers that
+	// slipped past the verdict. The baseline anchor read the cheap endpoint's
+	// share drifting across one half as congestion, the per-tick p99 fired on
+	// ordinary pauses, and a burst of fast samples pinned it to the floor for
+	// most of an hour; the SLO anchor has no baseline to drag, and the ratio
+	// guard tells a slow cohort from a slow tick.
+	//
+	// Without an SLOTarget there is nothing to anchor to, and it is the relative
+	// law, exactly as PresetBalanced.
 	PresetNone Preset = iota
 
-	// PresetBalanced is the default law spelled out: the relative anchor at 2x
-	// baseline, single-tick decisions, no fast recovery, every gain at its
-	// default. It is equivalent to PresetNone by construction; it exists so a
-	// config can say what it means, and so a service can pin its behaviour
-	// against a future change of defaults.
+	// PresetBalanced is the relative law: the baseline anchor at 2x, single-tick
+	// decisions, the per-tick p99 guard, every gain at its default. It was the
+	// default before PresetNone moved to the SLO anchor; pin it to keep that
+	// behaviour, or to run the relative law with an SLO.
 	PresetBalanced
 
 	// PresetLatencyFirst trades utilization for the SLO: the threshold becomes
@@ -332,11 +347,27 @@ func applyPreset(c Config) Config {
 		if c.RecoverTicks <= 0 {
 			c.RecoverTicks = 1
 		}
-	case PresetBalanced, PresetNone:
-		// Nothing to do: the defaults below *are* the balanced law.
+	case PresetBalanced:
+		if c.Anchor == AnchorUnset {
+			c.Anchor = AnchorBaseline
+		}
+	case PresetNone:
+		if c.SLOTarget > 0 {
+			if c.Anchor == AnchorUnset {
+				c.Anchor = AnchorSLO
+			}
+			if c.TailTolerance == 0 {
+				c.TailTolerance = defaultTailTolerance
+			}
+		}
 	}
 	return c
 }
+
+// defaultTailTolerance is the tail tolerance PresetNone uses with an SLOTarget:
+// the low end of the useful range, so a real blowout still fires the guard
+// while a cohort of a different endpoint does not.
+const defaultTailTolerance = 0.05
 
 func withDefaults(c Config) Config {
 	c = applyPreset(c)

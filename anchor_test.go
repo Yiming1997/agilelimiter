@@ -32,14 +32,16 @@ func TestSLOAnchorIgnoresBenignRise(t *testing.T) {
 	}
 }
 
-// The same rise against the default anchor, pinned as the regression the new
-// mode is an answer to: the rate falls to MinRate and stays there.
+// The same rise against the relative law, pinned as the regression the SLO
+// anchor is an answer to: the rate falls to MinRate and stays there. It is why
+// PresetNone uses the SLO anchor when there is an SLO.
 func TestBaselineAnchorCollapsesOnBenignRise(t *testing.T) {
 	l := New(Config{
 		MinRate:     10,
 		MaxRate:     500,
 		InitialRate: 200,
 		SLOTarget:   200 * time.Millisecond, // 4x the latency that triggers the collapse
+		Preset:      PresetBalanced,
 	})
 	for i := 0; i < 40; i++ {
 		feed(l, 20*time.Millisecond, 100)
@@ -181,7 +183,7 @@ func TestSLOAnchorWithoutSLOFallsBack(t *testing.T) {
 // The defaults must not move: AnchorBaseline with no hysteresis is the shipped
 // behaviour, and the SLO anchor gets 2/2 without being asked.
 func TestAnchorDefaults(t *testing.T) {
-	base := withDefaults(Config{MinRate: 1, MaxRate: 10, SLOTarget: time.Second})
+	base := withDefaults(Config{MinRate: 1, MaxRate: 10, SLOTarget: time.Second, Anchor: AnchorBaseline})
 	if base.BackoffTicks != 1 || base.RecoverTicks != 1 {
 		t.Fatalf("baseline anchor ticks = %d/%d, want 1/1", base.BackoffTicks, base.RecoverTicks)
 	}

@@ -146,6 +146,7 @@ func TestConcurrencySLOTailGuard(t *testing.T) {
 		MaxLimit:     1000,
 		InitialLimit: 100,
 		SLOTarget:    50 * time.Millisecond,
+		Preset:       PresetBalanced, // the per-tick p99 guard
 	})
 	// Median handling time is healthy, but 10% of requests are slow.
 	for i := 0; i < 3; i++ {

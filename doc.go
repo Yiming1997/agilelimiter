@@ -13,11 +13,13 @@
 //	slow baseline (one EWMA)  ─┼─> target window ─> AIMD / hold ─> clamp ─> bucket.SetRate
 //	p99 (per-tick histogram)  ─┘   (baseline)       + p99 SLO guard
 //
-// The tick's median is compared against a window derived from the slow EWMA
-// baseline: while it stays under (1+TargetInflation) x baseline the controller
-// probes the rate up; once it rises past that window it backs off by a fixed
-// step. Operating with some queuing — rather than backing off at the first sign
-// of it — is what keeps utilization reasonable.
+// The tick's median is compared against a window: with an SLOTarget, by default,
+// 0.8 x SLOTarget; without one, (1+TargetInflation) x the slow EWMA baseline.
+// While the median stays under it the controller probes the rate up; once it
+// rises past it the controller backs off by a fixed step. Operating with some
+// queuing — rather than backing off at the first sign of it — is what keeps
+// utilization reasonable. The tail guard, by default, backs off when more than
+// 5% of a tick is above the SLO by more than its statistical margin.
 //
 // Measurement discipline (important): feed Observe the *downstream* round-trip
 // time — measured from the moment the request is actually sent, NOT from the

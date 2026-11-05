@@ -131,6 +131,7 @@ func TestTailGuardFiresOnOneTimeout(t *testing.T) {
 		MinRate: 10, MaxRate: 1000, InitialRate: 500,
 		SLOTarget: 200 * time.Millisecond,
 		Tick:      250 * time.Millisecond,
+		Preset:    PresetBalanced, // the per-tick p99 guard
 	})
 	for i := 0; i < 200; i++ {
 		l.Observe(10 * time.Millisecond)

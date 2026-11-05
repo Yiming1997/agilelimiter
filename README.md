@@ -530,6 +530,7 @@ type Verdict func(r *http.Request, status int, h http.Header, d time.Duration) a
 |---|---|---|
 | request context canceled | not observed | the client went away; the handler returned early because nobody is listening |
 | 429, 502, 503, 504 | outage → back off | "cannot serve right now" |
+| any other 4xx (400, 401, 403, 404, …) | not observed at all | refused before the work: a scanner's 404s or a wave of 401s answer in microseconds, and enough of them drag the median — and the baseline — to ~0 |
 | 500, 501, other 5xx | a normal round trip | "your code has a bug" — backing off fixes nothing |
 | a cache hit (`Age > 0`, `X-Cache: HIT`, …) | not observed at all | a cheap path says nothing about remaining capacity |
 
@@ -575,17 +576,17 @@ the response. It cannot be a fixed set of built-in cases either, for two reasons
 - **The list does not converge.** Every year adds a proxy header, an async
   endpoint, a framework convention. One option per case is a treadmill.
 - **Every built-in case is wrong for somebody.** A 202 is free if your queue is
-  cheap and expensive if enqueueing *is* the bottleneck; a 4xx flood is noise from
-  a client bug and signal from a broken auth service. The library does not know
-  which company it is in.
+  cheap and expensive if enqueueing *is* the bottleneck; a 4xx that runs your
+  whole handler before refusing (a validation error at the end of an expensive
+  query) is real work. The library does not know which company it is in.
 
 So it is split into three layers:
 
 | Layer | Who owns it | Can it be overridden? |
 |---|---|---|
 | **Truncated measurement** — the call was canceled, or the client disconnected | the library | **no.** A truncated sample is not a fast response, it is not a measurement at all |
-| **Default policy** — 429/5xx, dial failures, cache hits | `DefaultVerdict`, about six lines | yes — replace it wholesale |
-| **Everything else** — health paths, 202, 4xx floods, your own error types | you, one line each | — |
+| **Default policy** — 429/5xx, dial failures, client errors (inbound), cache hits | `DefaultVerdict`, about six lines | yes — replace it wholesale |
+| **Everything else** — health paths, 202, expensive 4xx, your own error types | you, one line each | — |
 
 The middle layer ships as a *function* rather than as options because a function
 is readable, testable as a pure function, and composable: your verdict can call
@@ -599,7 +600,7 @@ is readable, testable as a pure function, and composable: your verdict can call
 | CORS preflight, `HEAD` | depends on your routes | `Aborted` |
 | 202 Accepted / fire-and-forget | depends on whether enqueueing is your bottleneck | `Aborted` or `Reached` |
 | circuit-breaker fallback | your own error, not a `*net.OpError` | `Unreachable` |
-| 4xx flood | your business judgement | `Aborted` |
+| a 4xx that did the expensive work first | the default skips every 4xx except 429 | `Reached` for that route |
 | SSE / long poll / websocket | not cheap — it drags the median up for everyone else | its own limiter |
 
 ### What no amount of filtering fixes

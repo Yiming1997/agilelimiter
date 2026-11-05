@@ -240,6 +240,21 @@ func TestBugStatusIsObservedNormally(t *testing.T) {
 	}
 }
 
+// A scanner hammering paths that do not exist gets 404s in microseconds. Observed,
+// they outnumber the real requests, drag the median and the baseline to ~0, and
+// leave the real latency reading as congestion once the scan stops. Through the
+// middleware they must not reach the controller at all.
+func TestClientErrorIsNotObserved(t *testing.T) {
+	lim := newFastLimiter(t)
+	driveFor(t, Wrap(fastHandler(http.StatusNotFound), lim), 300*time.Millisecond)
+	if got := lim.Limit(); got != 100 {
+		t.Fatalf("limit moved to %d on 404s; client errors must not be observed", got)
+	}
+	if s := lim.Stats(); s.Samples != 0 {
+		t.Fatalf("%d samples recorded from 404s, want 0", s.Samples)
+	}
+}
+
 // The default is a pure function, so its rules are testable without a limiter.
 func TestDefaultVerdictRules(t *testing.T) {
 	ok := httptest.NewRequest(http.MethodGet, "/x", nil)
@@ -260,7 +275,11 @@ func TestDefaultVerdictRules(t *testing.T) {
 		{"500 observed (a bug is not capacity)", ok, 500, http.Header{}, agilelimiter.Reached},
 		{"503 backs off", ok, 503, http.Header{}, agilelimiter.Unreachable},
 		{"429 backs off", ok, 429, http.Header{}, agilelimiter.Unreachable},
-		{"404 observed", ok, 404, http.Header{}, agilelimiter.Reached},
+		{"400 skipped (a client error is not capacity)", ok, 400, http.Header{}, agilelimiter.Aborted},
+		{"401 skipped", ok, 401, http.Header{}, agilelimiter.Aborted},
+		{"403 skipped", ok, 403, http.Header{}, agilelimiter.Aborted},
+		{"404 skipped", ok, 404, http.Header{}, agilelimiter.Aborted},
+		{"499 skipped", ok, 499, http.Header{}, agilelimiter.Aborted},
 		{"cache hit skipped", ok, 200, hit, agilelimiter.Aborted},
 		{"canceled request skipped", canceled, 200, http.Header{}, agilelimiter.Aborted},
 	}

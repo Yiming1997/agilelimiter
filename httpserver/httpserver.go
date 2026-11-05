@@ -94,6 +94,11 @@ func WithVerdict(v Verdict) Option {
 //	                                        returned early because nobody is
 //	                                        listening, not because it was fast
 //	429, 502, 503, 504         Unreachable  "cannot serve right now"
+//	any other 4xx              Aborted      the request was refused before the
+//	                                        work: a 404 from a scanner, a 401, a
+//	                                        400 says nothing about capacity, and
+//	                                        a flood of them answers in
+//	                                        microseconds
 //	cache hit (Age, X-Cache)   Aborted      no expensive path was touched
 //	anything else              Reached      including 500, which is usually a
 //	                                        bug: backing off would turn a failing
@@ -112,6 +117,8 @@ func DefaultVerdict(r *http.Request, status int, h http.Header, d time.Duration)
 		return agilelimiter.Aborted
 	case defaultUnavailableStatus(status):
 		return agilelimiter.Unreachable
+	case status >= 400 && status < 500:
+		return agilelimiter.Aborted
 	case IsCacheHitHeader(h):
 		return agilelimiter.Aborted
 	default:

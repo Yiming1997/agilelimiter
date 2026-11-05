@@ -390,6 +390,7 @@ func runRealOutbound(arm rtArm, world []outWorld) []rtScore {
 			}
 		}
 		if lim != nil {
+			simhook.Use(lim, w.demand*rtDt.Seconds())
 			simhook.Step(lim)
 			sc.end = lim.Stats()
 			if sc.end.Rate < 0.99*rate {
@@ -642,6 +643,11 @@ func runRealInbound(arm rtArm, world []inWorld) []rtScore {
 					count(routeServer(lim, healthz, dur(0.00005*rtTail(rng))))
 				}
 			}
+			used := inflight
+			if admitShare < 1 {
+				used = float64(lim.Limit())
+			}
+			simhook.Use(lim, used)
 			before := lim.Stats().Rate
 			simhook.Step(lim)
 			sc.end = lim.Stats()

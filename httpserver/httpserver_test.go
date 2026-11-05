@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
@@ -196,13 +197,24 @@ func newFastLimiter(t *testing.T) *agilelimiter.ConcurrencyLimiter {
 	return lim
 }
 
-// driveFor serves requests through h for d, discarding the responses.
+// driveFor serves requests through h for d from more concurrent clients than
+// newFastLimiter's starting limit, discarding the responses. One client at a
+// time would never use more than one slot, and a limit nobody uses is not
+// raised however healthy the latency.
 func driveFor(t *testing.T, h http.Handler, d time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(d)
-	for time.Now().Before(deadline) {
-		h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/x", nil))
+	var wg sync.WaitGroup
+	for i := 0; i < 150; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for time.Now().Before(deadline) {
+				h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/x", nil))
+			}
+		}()
 	}
+	wg.Wait()
 }
 
 func fastHandler(status int) http.Handler {

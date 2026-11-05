@@ -498,6 +498,10 @@ func New(cfg Config) *Limiter {
 		stop:   make(chan struct{}),
 	}
 	l.ctrl = newController(cfg, h, func(rate int) { b.setRate(rate, rateWindow) })
+	l.ctrl.usage = func() (float64, bool) {
+		g := b.takeGrants()
+		return float64(g) / cfg.Tick.Seconds(), g > 0
+	}
 	return l
 }
 
@@ -686,6 +690,16 @@ type Stats struct {
 	// never resets for the life of the limiter, so a recovery from an outage is
 	// an ordinary additive ramp, not a second slow start.
 	ColdStart bool
+
+	// Used is how much of the knob the last tick used: callers that asked
+	// Take for a slot, per second, on a Limiter; the most requests in flight
+	// at once on a ConcurrencyLimiter. It is zero when nothing went through
+	// Take or TryTake.
+	//
+	// While Used is under half of Rate a healthy tick holds the knob instead of
+	// raising it. Export it next to Rate: the gap between them is headroom the
+	// limiter has actually seen traffic use, at most a factor of two.
+	Used float64
 }
 
 // Stats returns a snapshot of the controller's internal signals.
@@ -728,6 +742,14 @@ func init() {
 			l.ctrl.step()
 		case *ConcurrencyLimiter:
 			l.ctrl.step()
+		}
+	}
+	simhook.Use = func(limiter any, used float64) {
+		switch l := limiter.(type) {
+		case *Limiter:
+			l.bucket.grants.Add(uint64(used + 0.5))
+		case *ConcurrencyLimiter:
+			l.sem.notePeak(int64(used + 0.5))
 		}
 	}
 }

@@ -18,6 +18,7 @@ import "sync/atomic"
 type semaphore struct {
 	limit    atomic.Int64 // max concurrent requests, set by the controller
 	inflight atomic.Int64 // requests currently being served
+	peak     atomic.Int64 // most requests in flight since the last takePeak
 }
 
 func newSemaphore(limit int) *semaphore {
@@ -48,10 +49,26 @@ func (s *semaphore) tryAcquire() bool {
 			return false
 		}
 		if s.inflight.CompareAndSwap(n, n+1) {
+			s.notePeak(n + 1)
 			return true
 		}
 	}
 }
+
+// notePeak raises the tick's peak to n.
+func (s *semaphore) notePeak(n int64) {
+	for {
+		p := s.peak.Load()
+		if n <= p || s.peak.CompareAndSwap(p, n) {
+			return
+		}
+	}
+}
+
+// takePeak returns the most requests in flight since the last call, and starts
+// the next window at the current count, so a request spanning ticks counts in
+// each of them.
+func (s *semaphore) takePeak() int64 { return s.peak.Swap(s.inflight.Load()) }
 
 // release frees one slot. Every successful tryAcquire must be paired with
 // exactly one release.

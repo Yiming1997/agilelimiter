@@ -31,9 +31,13 @@ func TestDefaultPolicyTreatsFastFailureAsHealthy(t *testing.T) {
 		SLOTarget: 200 * time.Millisecond,
 		Clock:     fc,
 	})
+	// Callers use the whole rate, as they would against a dependency they
+	// depend on; a rate nobody uses is not raised at all.
 	for i := 0; i < 20; i++ {
-		if err := l.Do(func() error { return errRefused }); !errors.Is(err, errRefused) {
-			t.Fatalf("Do returned %v, want errRefused", err)
+		for k, n := 0, int(l.Rate()); k < n; k++ {
+			if err := l.Do(func() error { return errRefused }); !errors.Is(err, errRefused) {
+				t.Fatalf("Do returned %v, want errRefused", err)
+			}
 		}
 		l.ctrl.step()
 	}

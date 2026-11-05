@@ -194,6 +194,7 @@ func runClient(cfg agilelimiter.Config, mixes []clientMix, dur time.Duration) ft
 		for _, e := range ev {
 			routeClient(lim, e.client, e.d)
 		}
+		simhook.Use(lim, calls)
 		simhook.Step(lim)
 
 		if t >= ftWarm {
@@ -416,6 +417,7 @@ func runServer(cfg agilelimiter.ConcurrencyConfig, mixes []serverMix, dur time.D
 		for _, e := range ev {
 			routeServer(lim, e.server, e.d)
 		}
+		simhook.Use(lim, inflight)
 		simhook.Step(lim)
 
 		if t >= ftWarm {

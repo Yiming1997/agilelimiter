@@ -78,6 +78,7 @@ func runOutTampered(m outModel, cfg Config, tp tamper) robustRun {
 		for _, d := range obs {
 			l.Observe(d)
 		}
+		simhook.Use(l, sent)
 		simhook.Step(l)
 		rr.tr = append(rr.tr, tickRec{sent: sent, good: sent * goodFraction(lat, m.slo)})
 		rr.rates = append(rr.rates, rate)
@@ -443,6 +444,7 @@ func runInTampered(m inModel, cfg ConcurrencyConfig, tp tamper) trace {
 		for _, d := range obs {
 			l.Observe(d)
 		}
+		simhook.Use(l, inflight)
 		simhook.Step(l)
 		tr = append(tr, tickRec{sent: done, good: done * goodFraction(lat, m.slo)})
 	}

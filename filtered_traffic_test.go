@@ -460,10 +460,10 @@ func TestFilteredInbound(t *testing.T) {
 		{"1% 503", "Unreachable", false, true, []serverMix{{call: dep503, share: steady(0.01)}}},
 		{"hits 30%->70%, untagged", "Reached", true, false, []serverMix{{call: srvHitPlain, share: hourly(0.3, 0.7)}}},
 		{"5% fast 500", "Reached", false, false, []serverMix{{call: bug500, share: steady(0.05)}}},
-		{"20% 401", "Reached", false, false, []serverMix{{call: authFail, share: steady(0.2)}}},
-		{"10% scanner 404", "Reached", false, false, []serverMix{{call: scanner404, share: steady(0.1)}}},
-		{"30% scanner 404", "Reached", false, false, []serverMix{{call: scanner404, share: steady(0.3)}}},
-		{"scanner 404 0%->60%", "Reached", true, false, []serverMix{{call: scanner404, share: hourly(0, 0.6)}}},
+		{"20% 401", "Aborted", false, true, []serverMix{{call: authFail, share: steady(0.2)}}},
+		{"10% scanner 404", "Aborted", false, true, []serverMix{{call: scanner404, share: steady(0.1)}}},
+		{"30% scanner 404", "Aborted", false, true, []serverMix{{call: scanner404, share: steady(0.3)}}},
+		{"scanner 404 0%->60%", "Aborted", true, true, []serverMix{{call: scanner404, share: hourly(0, 0.6)}}},
 		{"README mix: tagged hits, /healthz, 5% gone", "filtered", true, true, []serverMix{
 			{call: srvHit, share: hourly(0.3, 0.7)}, {call: healthz, rate: 50}, {call: clientGone, share: steady(0.05)}}},
 	} {

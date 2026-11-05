@@ -188,7 +188,15 @@ func (l *ConcurrencyLimiter) Release() { l.sem.release() }
 // finished. Because admission never blocks, this is clean by construction — there
 // is no throttle wait to accidentally contaminate the signal. Safe for
 // concurrent use and allocation-free.
-func (l *ConcurrencyLimiter) Observe(d time.Duration) { l.hist.record(d) }
+//
+// A normal sample also clears probe mode, exactly as Limiter.Observe does: the
+// first request that completes proves the service is answering again, so the
+// clamp must return to FloorLimit. Without this the limit stayed at ProbeLimit
+// for the life of the process after a single Unavailable.
+func (l *ConcurrencyLimiter) Observe(d time.Duration) {
+	l.ctrl.clearProbe()
+	l.hist.record(d)
+}
 
 // Do admits a request if there is room and runs fn, observing fn's outcome; when
 // the limit is reached it returns ErrOverloaded without running fn. The slot is
@@ -225,6 +233,7 @@ func (l *ConcurrencyLimiter) observeOutcome(d time.Duration, err error) {
 	case out == Aborted:
 		// Nothing: the service never expressed an opinion.
 	default:
+		l.ctrl.clearProbe()
 		l.hist.record(d)
 	}
 }

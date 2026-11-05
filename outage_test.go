@@ -177,6 +177,64 @@ func TestDeadlineExceededIsStillObserved(t *testing.T) {
 	}
 }
 
+// A truncated measurement is a lower bound on the real duration. Past the SLO
+// that bound is evidence of slowness and is kept; under it, or with no SLO to
+// compare against, it says nothing and is dropped. Both limiters, the same rule.
+func TestObserveTruncatedKeepsOnlyWhatIsPastTheSLO(t *testing.T) {
+	const slo = 100 * time.Millisecond
+	for _, c := range []struct {
+		name string
+		slo  time.Duration
+		d    time.Duration
+		want uint64
+	}{
+		{"past the SLO", slo, 150 * time.Millisecond, 1},
+		{"under the SLO", slo, 50 * time.Millisecond, 0},
+		{"at the SLO", slo, slo, 0},
+		{"no SLO", 0, time.Second, 0},
+	} {
+		l := New(Config{MaxRate: 1000, InitialRate: 100, SLOTarget: c.slo})
+		l.ObserveTruncated(c.d)
+		cl := NewConcurrency(ConcurrencyConfig{MaxLimit: 100, InitialLimit: 10, SLOTarget: c.slo})
+		cl.ObserveTruncated(c.d)
+		for _, n := range []uint64{l.hist.total.Load(), cl.hist.total.Load()} {
+			if n != c.want {
+				t.Errorf("%s: %d samples recorded, want %d", c.name, n, c.want)
+			}
+		}
+	}
+}
+
+// Do applies it to a canceled call, under the default policy and under a
+// Classify that calls cancellation Aborted — the README's own example — alike:
+// the rule is about the measurement, not the policy.
+func TestSlowCanceledCallIsEvidence(t *testing.T) {
+	for _, classify := range []func(error) Outcome{nil, classifyTest, func(error) Outcome { return Aborted }} {
+		fc := &fakeClock{now: time.Unix(1_000_000, 0)}
+		l := New(Config{MaxRate: 1000, InitialRate: 100, SLOTarget: 200 * time.Millisecond,
+			Classify: classify, Clock: fc})
+		l.Do(func() error {
+			fc.now = fc.now.Add(300 * time.Millisecond) // the caller gave up after 300ms
+			return context.Canceled
+		})
+		p50, _, n := l.hist.snapshot()
+		if n != 1 || p50 < 200*time.Millisecond {
+			t.Fatalf("a call canceled after 300ms against a 200ms SLO: %d samples, p50 %v; want 1 at >= 200ms", n, p50)
+		}
+	}
+}
+
+// A call nobody waited for does not show that the downstream answers again, so
+// keeping one must not end probe mode.
+func TestObserveTruncatedKeepsProbeMode(t *testing.T) {
+	l := New(Config{FloorRate: 50, ProbeRate: 5, MaxRate: 1000, InitialRate: 100, SLOTarget: 100 * time.Millisecond})
+	l.Unavailable()
+	l.ObserveTruncated(time.Second)
+	if !l.ctrl.probe {
+		t.Fatal("a truncated sample ended probe mode")
+	}
+}
+
 // The built-in default is overridable: someone who wants cancellations counted
 // can say so with Classify.
 func TestClassifyOverridesTheCanceledDefault(t *testing.T) {

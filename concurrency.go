@@ -1,6 +1,7 @@
 package agilelimiter
 
 import (
+	"context"
 	"errors"
 	"sync"
 	"time"
@@ -198,6 +199,21 @@ func (l *ConcurrencyLimiter) Observe(d time.Duration) {
 	l.hist.record(d)
 }
 
+// ObserveTruncated records a request whose client went away after d, before
+// the handler finished — see Limiter.ObserveTruncated. Its handling time is at
+// least d, so it is recorded only when d is already past SLOTarget.
+//
+// Inbound this matters more than outbound: a client's timeout reaches the
+// server as a cancellation, not as a slow answer. When the service is slow
+// enough that clients give up, the requests they give up on are all of the
+// slow ones, and dropping them left the limiter with no samples at all — it
+// sat at whatever limit it had while every request timed out.
+func (l *ConcurrencyLimiter) ObserveTruncated(d time.Duration) {
+	if truncatedIsSlow(l.cfg, d) {
+		l.hist.record(d)
+	}
+}
+
 // Do admits a request if there is room and runs fn, observing fn's outcome; when
 // the limit is reached it returns ErrOverloaded without running fn. The slot is
 // released even if fn panics.
@@ -231,7 +247,11 @@ func (l *ConcurrencyLimiter) observeOutcome(d time.Duration, err error) {
 	case out == Unreachable:
 		l.Unavailable()
 	case out == Aborted:
-		// Nothing: the service never expressed an opinion.
+		// The service never expressed an opinion — unless the client left only
+		// after the request had been slow for longer than the SLO.
+		if errors.Is(err, context.Canceled) {
+			l.ObserveTruncated(d)
+		}
 	default:
 		l.ctrl.clearProbe()
 		l.hist.record(d)

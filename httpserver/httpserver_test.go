@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"agilelimiter"
+	"agilelimiter/internal/simhook"
 )
 
 // newLimiter builds a started limiter. A high InitialLimit makes admission the
@@ -432,6 +433,31 @@ func TestCanceledRequestIsNotObserved(t *testing.T) {
 
 	if got := lim.Limit(); got != 100 {
 		t.Fatalf("limit moved to %d on canceled requests; they must not be observed", got)
+	}
+}
+
+// A client's timeout reaches the handler as a cancellation. A request canceled
+// only after it had run past the SLO took at least that long, which makes it
+// evidence of a slow service: it is recorded as its measured duration. Dropping
+// it left the limiter blind while every request timed out.
+func TestSlowCanceledRequestIsObserved(t *testing.T) {
+	lim := agilelimiter.NewConcurrency(agilelimiter.ConcurrencyConfig{
+		MaxLimit: 200, InitialLimit: 100, SLOTarget: 20 * time.Millisecond,
+	})
+	h := Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(40 * time.Millisecond) // the client gives up meanwhile
+	}), lim)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	req := httptest.NewRequest(http.MethodGet, "/x", nil).WithContext(ctx)
+	for i := 0; i < 3; i++ {
+		h.ServeHTTP(&nopWriter{}, req)
+	}
+	simhook.Step(lim)
+
+	if s := lim.Stats(); s.Samples != 3 || s.P50 < 20*time.Millisecond {
+		t.Fatalf("recorded %d samples, p50 %v; want the 3 slow canceled requests at >= 20ms", s.Samples, s.P50)
 	}
 }
 

@@ -90,7 +90,9 @@ func WithVerdict(v Verdict) Option {
 // DefaultVerdict is what Wrap does when no verdict is supplied. Copy it and edit
 // it rather than looking for an option that tweaks one branch.
 //
-//	request context canceled   Aborted      the client went away; the handler
+//	request context canceled   Aborted      (Wrap keeps it once it is past the
+//	                                        SLO; see ObserveTruncated)
+//	                                        the client went away; the handler
 //	                                        returned early because nobody is
 //	                                        listening, not because it was fast
 //	429, 502, 503, 504         Unreachable  "cannot serve right now"
@@ -214,10 +216,15 @@ func Wrap(next http.Handler, lim *agilelimiter.ConcurrencyLimiter, opts ...Optio
 		d := time.Since(start)
 
 		// A canceled request is a truncated measurement: the handler returned
-		// because nobody is listening, not because it was fast. That is a fact
+		// because nobody is listening, not because it was fast, so d is only a
+		// lower bound. ObserveTruncated keeps it when that bound is already past
+		// the SLO: a client's timeout arrives here as a cancellation, and the
+		// requests clients give up on are the slowest ones — dropping them all
+		// blinded the limiter in the overload it exists for. That is a fact
 		// about the measurement rather than a policy choice, so it is enforced
-		// here — replacing the verdict cannot reintroduce the bug.
+		// here — replacing the verdict cannot change it.
 		if r.Context().Err() != nil {
+			lim.ObserveTruncated(d)
 			return
 		}
 

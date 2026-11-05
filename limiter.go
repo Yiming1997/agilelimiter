@@ -513,6 +513,31 @@ func (l *Limiter) Observe(rtt time.Duration) {
 	l.hist.record(rtt)
 }
 
+// ObserveTruncated records a call that was cut short after d — canceled by
+// the caller before the answer arrived. Its real duration is unknown but at
+// least d. Once d is already past SLOTarget that lower bound is evidence the
+// downstream is slow, however the call would have ended, and it is recorded as
+// d. A shorter one says nothing — the caller may simply have left — and is
+// dropped, as is every one when there is no SLOTarget to compare against.
+//
+// Dropping them all is what blinds a limiter in the overload it exists for: the
+// calls a caller gives up on are the slowest ones, so the controller is left
+// with no samples, or only the lucky fast ones.
+//
+// It never ends probe mode: a call nobody waited for does not show that the
+// downstream is answering again.
+func (l *Limiter) ObserveTruncated(d time.Duration) {
+	if truncatedIsSlow(l.cfg, d) {
+		l.hist.record(d)
+	}
+}
+
+// truncatedIsSlow reports whether a measurement cut short after d is evidence:
+// a lower bound already past the SLO.
+func truncatedIsSlow(cfg Config, d time.Duration) bool {
+	return cfg.SLOTarget > 0 && d > cfg.SLOTarget
+}
+
 // Do runs fn as one rate-limited downstream call: it takes a slot from the
 // bucket, times fn, and feeds the outcome back to the controller. Callers never
 // touch Take/Observe directly, so they cannot accidentally feed the wrong
@@ -554,9 +579,10 @@ func Do[T any](l *Limiter, fn func() (T, error)) (T, error) {
 //
 // A canceled call is the one failure the library can classify on its own: the
 // caller gave up, the downstream never answered, and the truncated round trip
-// would otherwise be recorded as a suspiciously fast success. DeadlineExceeded
-// is deliberately NOT included — that one means the downstream was too slow,
-// which is a real signal and must be observed.
+// would otherwise be recorded as a suspiciously fast success. It is still
+// passed to ObserveTruncated, which keeps it if it had already run past the
+// SLO. DeadlineExceeded is deliberately NOT included — that one means the
+// downstream was too slow, which is a real signal and must be observed.
 func defaultOutcome(err error) Outcome {
 	if err != nil && errors.Is(err, context.Canceled) {
 		return Aborted
@@ -575,7 +601,11 @@ func (l *Limiter) observeOutcome(d time.Duration, err error) {
 	case out == Unreachable:
 		l.Unavailable()
 	case out == Aborted:
-		// Nothing: the downstream never expressed an opinion.
+		// The downstream never expressed an opinion — unless the call was cut
+		// short only after it had been slow for longer than the SLO.
+		if errors.Is(err, context.Canceled) {
+			l.ObserveTruncated(d)
+		}
 	default:
 		l.ctrl.clearProbe()
 		l.hist.record(d)

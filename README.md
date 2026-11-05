@@ -168,7 +168,7 @@ lim := agilelimiter.New(agilelimiter.Config{
 | `Outcome` | When | What the controller is told |
 |---|---|---|
 | `Reached` | it reached the downstream and came back — 2xx, 5xx, timeout | the measured round trip, as usual |
-| `Unreachable` | it never arrived — refused, DNS, TLS, open breaker | a synthetic "congested" sample, so it backs off toward `ProbeRate` |
+| `Unreachable` | it never arrived — refused, DNS, TLS, open breaker | nothing per call; a tick dominated by these is an outage and backs off toward `ProbeRate` |
 | `Aborted` | the caller gave up, or the call never started | nothing |
 
 Details that matter:
@@ -176,16 +176,24 @@ Details that matter:
 - **The default is `Reached` for every error** (i.e. today's behaviour), so this
   is opt-in. It is right for anything the downstream answered; it is wrong only
   for calls that never arrived, and only you can tell the difference.
-- The synthetic sample is placed above the tolerated window and above
-  `SLOTarget`, so the fixed-step median backoff *and* the p99 tail guard both fire.
-  It is a no-op before there is anything to anchor against (no `SLOTarget`, no
-  sample yet) — inventing a baseline value would be worse than staying silent.
+- **A tick is an outage when its unreachable calls outnumber the reached ones two
+  to one.** That tick backs off one full step, whatever the tail mode or
+  `BackoffTicks`, and records one synthetic sample above the tolerated window and
+  above `SLOTarget`. A tick with fewer is not an outage, and the refusals in it
+  are not recorded at all: one refused call among a hundred answered ones says the
+  downstream is up. (Recording a sample for every tick that saw *any* refusal
+  made that one sample the p99 of every tick with fewer than 100 samples — 1%
+  refused held 5 req/s against a clean 63 — while in ratio mode 80% refused
+  climbed to `MaxRate`.)
+- The outage backoff is a no-op before there is anything to anchor against (no
+  `SLOTarget`, no sample yet) — inventing a baseline value would be worse than
+  staying silent.
 - **`ProbeRate` is the outage probe rate.** Backing off to 10 req/s is how the
   limiter keeps testing whether the downstream came back. Make sure it is a rate
   the downstream can absorb (× your instance count). Normal traffic is clamped at
   the higher `FloorRate`; only outage mode may go below it.
 - On the manual `Take`/`Observe` path, call `lim.Unavailable()` instead of
-  `Observe` for that attempt. Never both — that records two samples for one call.
+  `Observe` for that attempt. Never both — that counts one call twice.
   A subsequent normal `Observe` leaves outage mode.
 - `ConcurrencyLimiter` has the same options, for handlers that answer 503 without
   doing any work: `Config.Classify` and `lim.Unavailable()`.

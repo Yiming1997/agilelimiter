@@ -243,8 +243,9 @@ const (
 	// Unreachable means the call never reached the downstream: connection
 	// refused, DNS failure, TLS handshake rejected, an already-open circuit
 	// breaker. Its round trip is ~0 and says nothing about the downstream's
-	// health, so it is replaced by a synthetic "congested" sample that makes the
-	// controller back off toward MinRate — the rate it keeps probing with.
+	// health, so it is not recorded; instead a tick where such calls outnumber
+	// the reached ones two to one counts as an outage and backs off toward
+	// ProbeRate — the rate it keeps probing with. See Limiter.Unavailable.
 	Unreachable
 
 	// Aborted means the caller gave up, or the call never started. It is not a
@@ -552,22 +553,22 @@ func (l *Limiter) observeOutcome(d time.Duration, err error) {
 // connection, a DNS failure, an already-open circuit breaker. Record it instead
 // of Observe for that attempt: its round trip is ~0 and would read as a healthy
 // response, so the controller would raise the rate into a dependency that is
-// already down. This feeds a synthetic "congested" sample instead, which backs
-// the rate off toward MinRate; that floor is what keeps probing, so recovery is
-// still detected.
+// already down.
 //
-// It is a no-op before the controller has anything to anchor a synthetic value
-// against: with no SLOTarget and no samples yet, there is no honest number to
-// record, and inventing one would corrupt the baseline.
+// A tick in which these calls outnumber the observed ones two to one is an
+// outage: the rate backs off one step toward ProbeRate, the floor that keeps
+// probing so recovery is still detected. A tick with fewer is not — a refused
+// call among many answered ones says the downstream is up — and only lets the
+// floor fall to ProbeRate until the next observed call.
+//
+// An outage tick backs off only once the controller has something to anchor a
+// synthetic sample against: with no SLOTarget and no samples yet, there is no
+// honest number to record, and inventing one would corrupt the baseline.
 //
 // Use this from the manual Take/Observe path, or return Unreachable from
 // Config.Classify to have Do call it for you. Never do both for the same
-// attempt: that records two samples for one call.
-func (l *Limiter) Unavailable() {
-	if s, ok := l.ctrl.outageSample(); ok {
-		l.hist.record(s)
-	}
-}
+// attempt: that counts one call twice.
+func (l *Limiter) Unavailable() { l.ctrl.noteUnreachable() }
 
 // ObserveOutcome records how one call ended, applying Config.Classify to the
 // error. Use it from an integration that measures and classifies calls itself —

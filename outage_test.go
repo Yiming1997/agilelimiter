@@ -81,25 +81,48 @@ func TestUnreachableIsNoOpWithoutAnAnchor(t *testing.T) {
 	// nothing may be recorded — inventing one would corrupt the baseline.
 	l := New(Config{MinRate: 10, MaxRate: 100, InitialRate: 50})
 	l.Unavailable()
-	if _, _, n := l.hist.snapshot(); n != 0 {
-		t.Fatalf("recorded %d samples with nothing to anchor against, want 0", n)
+	l.ctrl.step()
+	if s := l.Stats(); s.Samples != 0 || s.Rate != 50 {
+		t.Fatalf("recorded %d samples and moved the rate to %v with nothing to anchor against, want 0 and 50",
+			s.Samples, s.Rate)
 	}
 }
 
 func TestUnreachableSampleReadsAsCongestion(t *testing.T) {
-	// With a baseline but no SLOTarget the synthetic sample must still land above
-	// the tolerated window, so the fixed-step backoff fires.
+	// With a baseline but no SLOTarget the synthetic sample of an outage tick
+	// must still land above the tolerated window, and the tick must back off.
 	l := New(Config{MinRate: 10, MaxRate: 1000, InitialRate: 200})
 	feed(l, 10*time.Millisecond, 100) // baseline = 10ms
 	high := 2 * 10 * time.Millisecond // (1+TargetInflation) x baseline, default 1.0
+	before := l.Rate()
 
 	l.Unavailable()
-	p50, _, n := l.hist.snapshot()
-	if n != 1 {
-		t.Fatalf("recorded %d samples, want 1", n)
+	l.ctrl.step()
+	s := l.Stats()
+	if s.Samples != 1 {
+		t.Fatalf("an outage tick recorded %d samples, want 1", s.Samples)
 	}
-	if p50 <= high {
-		t.Fatalf("synthetic sample %v must read above the tolerated window %v", p50, high)
+	if s.P50 <= high {
+		t.Fatalf("synthetic sample %v must read above the tolerated window %v", s.P50, high)
+	}
+	if s.Rate >= before {
+		t.Fatalf("an outage tick must back off: rate %v, was %v", s.Rate, before)
+	}
+}
+
+// A refusal among answered calls is not an outage: it must not reach the
+// histogram, so it cannot become a tick's p99.
+func TestMinorityUnreachableRecordsNothing(t *testing.T) {
+	l := New(Config{MinRate: 10, MaxRate: 1000, InitialRate: 200, SLOTarget: 100 * time.Millisecond})
+	feed(l, 10*time.Millisecond, 50)
+	for i := 0; i < 49; i++ {
+		l.Observe(10 * time.Millisecond)
+	}
+	l.Unavailable()
+	l.ctrl.step()
+	if s := l.Stats(); s.Samples != 49 || s.P99 > 20*time.Millisecond {
+		t.Fatalf("one refusal among 49 answers: %d samples, p99 %v; want 49 real samples and a real p99",
+			s.Samples, s.P99)
 	}
 }
 

@@ -228,3 +228,46 @@ func TestRecoveryFromDeepDipIsAdditive(t *testing.T) {
 		t.Fatalf("recovery must stay additive, got %v after 10 ticks", got)
 	}
 }
+
+// A healthy latency at a fraction of the rate says the traffic that came is
+// fine, not that the rate may go higher. Callers using 50 of 400 req/s must not
+// walk the rate up; callers using all of it must.
+func TestRateGrowsOnlyWhileInUse(t *testing.T) {
+	run := func(callsPerTick int) (*Limiter, float64) {
+		fc := &fakeClock{now: time.Unix(1_000_000, 0)}
+		l := New(Config{MaxRate: 4000, FloorRate: 10, InitialRate: 400, SLOTarget: 200 * time.Millisecond, Clock: fc})
+		for i := 0; i < 30; i++ {
+			n := callsPerTick
+			if n == 0 {
+				n = int(l.Rate())
+			}
+			for k := 0; k < n; k++ {
+				l.Do(func() error { fc.now = fc.now.Add(10 * time.Millisecond); return nil })
+			}
+			l.ctrl.step()
+		}
+		return l, l.Rate()
+	}
+	l, idle := run(50)
+	if idle != 400 {
+		t.Fatalf("callers using 50 of 400 req/s moved the rate to %v; it must hold", idle)
+	}
+	if u := l.Stats().Used; u != 50 {
+		t.Fatalf("Stats().Used = %v, want the 50 calls a tick that asked for a slot", u)
+	}
+	if _, busy := run(0); busy <= 400 {
+		t.Fatalf("callers using the whole rate left it at %v; a healthy tick must raise it", busy)
+	}
+}
+
+// A caller that only ever calls Observe gives the limiter no count of what it
+// used. That is unknown, not idle, and the rate grows as it always did.
+func TestUnknownUsageStillGrows(t *testing.T) {
+	l := New(Config{MaxRate: 1000, InitialRate: 100, SLOTarget: 200 * time.Millisecond})
+	for i := 0; i < 10; i++ {
+		feed(l, 10*time.Millisecond, 50)
+	}
+	if got := l.Rate(); got <= 100 {
+		t.Fatalf("rate %v did not grow with no usage counted", got)
+	}
+}

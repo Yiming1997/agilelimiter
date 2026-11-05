@@ -173,3 +173,70 @@ func TestConcurrencyLimitStaysWithinBounds(t *testing.T) {
 		}
 	}
 }
+
+// The inbound counterpart: 5 requests in flight under a limit of 100 must not
+// raise the limit; half of it in flight must.
+func TestConcurrencyLimitGrowsOnlyWhileInUse(t *testing.T) {
+	run := func(inflight int) (*ConcurrencyLimiter, int) {
+		l := NewConcurrency(ConcurrencyConfig{MaxLimit: 400, FloorLimit: 2, InitialLimit: 100, SLOTarget: 200 * time.Millisecond})
+		for i := 0; i < 30; i++ {
+			for k := 0; k < inflight; k++ {
+				if !l.TryTake() {
+					t.Fatalf("TryTake refused at %d in flight", k)
+				}
+			}
+			for k := 0; k < inflight; k++ {
+				l.Release()
+				l.Observe(10 * time.Millisecond)
+			}
+			l.ctrl.step()
+		}
+		return l, l.Limit()
+	}
+	l, idle := run(5)
+	if idle != 100 {
+		t.Fatalf("5 requests in flight moved the limit to %d; it must hold at 100", idle)
+	}
+	if u := l.Stats().Used; u != 5 {
+		t.Fatalf("Stats().Used = %v, want the peak of 5 in flight", u)
+	}
+	if _, busy := run(50); busy <= 100 {
+		t.Fatalf("half the limit in flight left it at %d; a healthy tick must raise it", busy)
+	}
+}
+
+// A limit that refused a request was full: the peak in flight that tick is the
+// limit, so a saturated limit always reads as in use and keeps growing.
+func TestFullLimitReadsAsInUse(t *testing.T) {
+	l := NewConcurrency(ConcurrencyConfig{MaxLimit: 400, InitialLimit: 10, SLOTarget: 200 * time.Millisecond})
+	for k := 0; k < 10; k++ {
+		l.TryTake()
+	}
+	if l.TryTake() {
+		t.Fatal("TryTake admitted past the limit")
+	}
+	for k := 0; k < 10; k++ {
+		l.Release()
+	}
+	l.Observe(10 * time.Millisecond)
+	l.ctrl.step()
+	if u := l.Stats().Used; u != 10 {
+		t.Fatalf("Stats().Used = %v after a refusal at limit 10, want 10", u)
+	}
+}
+
+// A request in flight across a tick boundary is in use in both ticks: the next
+// window starts at the current count, not at zero.
+func TestLongRequestCountsInEveryTick(t *testing.T) {
+	l := NewConcurrency(ConcurrencyConfig{MaxLimit: 400, InitialLimit: 10, SLOTarget: 200 * time.Millisecond})
+	for k := 0; k < 3; k++ {
+		l.TryTake()
+	}
+	l.Observe(10 * time.Millisecond)
+	l.ctrl.step()
+	l.Observe(10 * time.Millisecond)
+	l.ctrl.step() // nothing new acquired this tick, three still in flight
+	if u := l.Stats().Used; u != 3 {
+		t.Fatalf("Stats().Used = %v with three requests still in flight, want 3", u)
+	}
+}

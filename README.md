@@ -323,7 +323,10 @@ Each tick:
    `high = slow * (1 + TargetInflation)`, `low = high * (1 - Deadband)` — or
    against `0.8 * SLOTarget` outright under `AnchorSLO` (see below):
    - `p50 <= low` → healthy, probe up: `+UpStep`, or `×SlowStartGain` while the
-     limiter has never seen congestion (cold start — see below).
+     limiter has never seen congestion (cold start — see below) — but only while
+     the tick used at least half of the knob (`Stats().Used`). A healthy latency
+     at 28 requests in flight says nothing about a limit of 200, and raising it
+     anyway left the next slowdown or surge with all 200 at once.
    - `p50 >= high` → congested, fixed `-DownStep`.
    - in between → hold (deadband).
 4. If the tail guard fires — `p99` above `SLOTarget x TailFactor`, or (in ratio
@@ -762,7 +765,8 @@ request fails. The limiter will happily raise the rate into it.
   nothing, so a *frozen* rate and a *steady* one look identical. Alert on
   `Samples == 0` for more than a few ticks; it is what tells you the controller
   went blind (low traffic, or a pipeline that stopped observing because every
-  response was a cache hit).
+  response was a cache hit). Export `Stats().Used` next to `Rate()`: it is what
+  the traffic actually took, and the knob never grows past twice it.
 
 ## Testing
 

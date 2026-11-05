@@ -22,6 +22,14 @@ const sloWindowFraction = 0.8
 // weaker.
 const tailSigma = 3.0
 
+// appLimitedHeadroom is how far above its use a knob may grow: a healthy tick
+// raises the rate or limit only while the tick used at least 1/appLimitedHeadroom
+// of it. Two leaves room for traffic to double before the knob is in the way,
+// and caps what a sudden surge or slowdown gets in its first tick at twice the
+// traffic that was actually there — TCP's congestion-window validation (RFC
+// 7661) reduced to a ratio.
+const appLimitedHeadroom = 2.0
+
 // controller turns the latency signal into a target rate.
 //
 // The simplified law is intentionally small:
@@ -61,6 +69,14 @@ type controller struct {
 	// above/below count consecutive ticks on each side of the band. A tick in
 	// the band resets both; an action resets the counter that produced it.
 	above, below int
+
+	// usage reports how much of the knob the last tick used — callers asking
+	// for a slot per second for a rate, the peak requests in flight for a
+	// limit — and false when nothing was counted (a caller that only ever
+	// calls Observe). Nil, or false, means unknown, and a healthy tick raises
+	// the knob as it always did. See step.
+	usage    func() (float64, bool)
+	lastUsed float64
 
 	// over is the smoothed fraction of samples above the tail target. It only
 	// exists when TailTolerance > 0.
@@ -137,6 +153,11 @@ func (c *controller) step() {
 
 	p50, p99, n, above := c.hist.snapshotAbove(c.snapshotTail())
 	c.lastP50, c.lastP99, c.lastSamples = p50, p99, n
+	used, usedKnown := 0.0, false
+	if c.usage != nil {
+		used, usedKnown = c.usage() // drained every tick, sampled or not
+	}
+	c.lastUsed = used
 	if n == 0 {
 		return
 	}
@@ -178,9 +199,15 @@ func (c *controller) step() {
 		c.below++
 		c.above = 0
 		if c.below >= c.cfg.RecoverTicks {
-			if c.rampUp() {
+			switch {
+			case usedKnown && used*appLimitedHeadroom < c.rate:
+				// Hold. A healthy latency at a fraction of the knob says the
+				// traffic that came is fine, not that the knob may go higher:
+				// raising it anyway walked a limit at 28 in flight up to 200,
+				// and the next slowdown or surge got all 200 at once.
+			case c.rampUp():
 				factor = c.cfg.SlowStartGain
-			} else {
+			default:
 				factor = 1 + c.cfg.UpStep
 			}
 			c.below = 0
@@ -297,6 +324,7 @@ func (c *controller) stats() Stats {
 		TailRatio:     c.over,
 		TailThreshold: c.tailThreshold,
 		ColdStart:     c.coldStart,
+		Used:          c.lastUsed,
 	}
 }
 

@@ -32,6 +32,8 @@ type bucket struct {
 	// avoid taking the mutex on the hot path just to read it.
 	perRequest atomic.Int64 // nanoseconds per grant
 	clock      Clock
+
+	grants atomic.Uint64 // grants since the last takeGrants
 }
 
 func newBucket(rate int, per time.Duration, clock Clock) *bucket {
@@ -51,9 +53,13 @@ func (b *bucket) setRate(rate int, per time.Duration) {
 	b.perRequest.Store(int64(per / time.Duration(rate)))
 }
 
+// takeGrants returns how many callers took a slot since the last call.
+func (b *bucket) takeGrants() uint64 { return b.grants.Swap(0) }
+
 // take blocks until the caller is allowed to proceed and returns the granted
 // time. The very first call is always granted immediately.
 func (b *bucket) take() time.Time {
+	b.grants.Add(1)
 	b.mu.Lock()
 	defer b.mu.Unlock()
 

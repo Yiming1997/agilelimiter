@@ -172,6 +172,10 @@ func NewConcurrency(cc ConcurrencyConfig) *ConcurrencyLimiter {
 		stop: make(chan struct{}),
 	}
 	l.ctrl = newController(cfg, h, func(limit int) { sem.setLimit(limit) })
+	l.ctrl.usage = func() (float64, bool) {
+		p := sem.takePeak()
+		return float64(p), p > 0
+	}
 	return l
 }
 

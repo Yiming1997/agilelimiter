@@ -1,6 +1,12 @@
-# agileLimiter
+<p align="center">
+  <img src="docs/logo.svg" alt="agileLimiter logo" width="144" height="144">
+</p>
 
-An adaptive, latency-driven rate limiter that protects a downstream dependency.
+<h1 align="center">agileLimiter</h1>
+
+<p align="center">
+  An adaptive, latency-driven rate limiter that protects a downstream dependency.
+</p>
 
 Standalone Go module (`module agilelimiter`), zero external dependencies. It is
 deliberately small: a **simple leaky bucket** (one mutex) is the *actuator*, and

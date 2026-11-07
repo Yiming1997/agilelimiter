@@ -216,3 +216,6 @@ More detail:
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+
+[中文文档](readme.zh.md)

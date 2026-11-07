@@ -51,7 +51,7 @@ import (
 	"testing"
 	"time"
 
-	"agilelimiter"
+	"github.com/Yiming1997/agilelimiter"
 	uberratelimit "go.uber.org/ratelimit"
 )
 

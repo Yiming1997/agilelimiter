@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"agilelimiter"
+	"github.com/Yiming1997/agilelimiter"
 )
 
 // A downstream with a cache in front of it. Two populations share one pipe:

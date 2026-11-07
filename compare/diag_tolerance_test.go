@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"agilelimiter"
+	"github.com/Yiming1997/agilelimiter"
 )
 
 func TestDiagTailToleranceTrace(t *testing.T) {

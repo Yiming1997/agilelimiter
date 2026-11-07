@@ -29,10 +29,10 @@ import (
 	"testing"
 	"time"
 
-	"agilelimiter"
-	"agilelimiter/httpclient"
-	"agilelimiter/httpserver"
-	"agilelimiter/internal/simhook"
+	"github.com/Yiming1997/agilelimiter"
+	"github.com/Yiming1997/agilelimiter/httpclient"
+	"github.com/Yiming1997/agilelimiter/httpserver"
+	"github.com/Yiming1997/agilelimiter/internal/simhook"
 )
 
 const (

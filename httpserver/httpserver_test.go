@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"agilelimiter"
-	"agilelimiter/internal/simhook"
+	"github.com/Yiming1997/agilelimiter"
+	"github.com/Yiming1997/agilelimiter/internal/simhook"
 )
 
 // newLimiter builds a started limiter. A high InitialLimit makes admission the

@@ -21,19 +21,10 @@ to use the headroom above the floor without overwhelming the other side.
 ## Install
 
 ```bash
-git clone https://github.com/Yiming1997/agilelimiter.git
-cd agilelimiter
-go test ./...
+go get github.com/Yiming1997/agilelimiter
 ```
 
 Requires Go 1.20 or newer. No external dependencies.
-
-The module path is currently `agilelimiter`. To use it from another local module,
-add a `replace` directive for now:
-
-```text
-replace agilelimiter => ../agilelimiter
-```
 
 ## Outbound: call a dependency
 
@@ -41,7 +32,7 @@ replace agilelimiter => ../agilelimiter
 import (
     "time"
 
-    "agilelimiter"
+    "github.com/Yiming1997/agilelimiter"
 )
 
 lim := agilelimiter.New(agilelimiter.Config{
@@ -66,7 +57,7 @@ off further.
 ### HTTP client
 
 ```go
-import "agilelimiter/httpclient"
+import "github.com/Yiming1997/agilelimiter/httpclient"
 
 client := &http.Client{
     Transport: httpclient.Wrap(http.DefaultTransport, lim),
@@ -122,7 +113,7 @@ across multiple calls.
 ### HTTP server middleware
 
 ```go
-import "agilelimiter/httpserver"
+import "github.com/Yiming1997/agilelimiter/httpserver"
 
 root := http.NewServeMux()
 root.Handle("/debug/limiter", httpserver.StatsHandler(lim))

@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"agilelimiter"
+	"github.com/Yiming1997/agilelimiter"
 )
 
 // nopWriter is a ResponseWriter that allocates nothing and stores nothing, so a

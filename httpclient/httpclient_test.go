@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"agilelimiter"
-	"agilelimiter/internal/simhook"
+	"github.com/Yiming1997/agilelimiter"
+	"github.com/Yiming1997/agilelimiter/internal/simhook"
 )
 
 func TestIsCacheHit(t *testing.T) {

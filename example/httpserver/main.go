@@ -18,8 +18,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"agilelimiter"
-	"agilelimiter/httpserver"
+	"github.com/Yiming1997/agilelimiter"
+	"github.com/Yiming1997/agilelimiter/httpserver"
 )
 
 func main() {

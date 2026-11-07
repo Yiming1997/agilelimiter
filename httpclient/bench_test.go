@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"agilelimiter"
+	"github.com/Yiming1997/agilelimiter"
 )
 
 // benchResp is reused so the transport allocates nothing: the benchmark should

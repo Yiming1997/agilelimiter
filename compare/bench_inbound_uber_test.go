@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"agilelimiter"
+	"github.com/Yiming1997/agilelimiter"
 )
 
 // Inbound benchmarks: the same simulated service, the same client population,

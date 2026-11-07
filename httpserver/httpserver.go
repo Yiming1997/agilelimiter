@@ -42,7 +42,7 @@ import (
 	"strings"
 	"time"
 
-	"agilelimiter"
+	"github.com/Yiming1997/agilelimiter"
 )
 
 // Verdict decides what one admitted request tells the controller. It is the only

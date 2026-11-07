@@ -30,7 +30,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"agilelimiter"
+	"github.com/Yiming1997/agilelimiter"
 )
 
 // service is a toy model of *this* process. Up to `parallel` concurrent

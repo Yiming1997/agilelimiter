@@ -13,22 +13,16 @@
 ## 安装
 
 ```bash
-git clone https://github.com/Yiming1997/agilelimiter.git
-cd agilelimiter
-go test ./...
+go get github.com/Yiming1997/agilelimiter
 ```
 
 需要 Go 1.20+，无外部依赖。
 
-当前 module 路径是 `agilelimiter`。在另一个本地模块里使用时，暂时加 replace：
-
-```text
-replace agilelimiter => ../agilelimiter
-```
-
 ## 出站：保护下游依赖
 
 ```go
+import "github.com/Yiming1997/agilelimiter"
+
 lim := agilelimiter.New(agilelimiter.Config{
     MaxRate:   500,                    // 硬上限
     FloorRate: 250,                    // 正常地板：你信得过的静态速率
@@ -50,7 +44,7 @@ err := lim.Do(func() error {
 ### HTTP client
 
 ```go
-import "agilelimiter/httpclient"
+import "github.com/Yiming1997/agilelimiter/httpclient"
 
 client := &http.Client{
     Transport: httpclient.Wrap(http.DefaultTransport, lim),
@@ -100,7 +94,7 @@ if errors.Is(err, agilelimiter.ErrOverloaded) {
 ### HTTP 中间件
 
 ```go
-import "agilelimiter/httpserver"
+import "github.com/Yiming1997/agilelimiter/httpserver"
 
 root := http.NewServeMux()
 root.Handle("/debug/limiter", httpserver.StatsHandler(lim))

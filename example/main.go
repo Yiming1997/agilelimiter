@@ -23,7 +23,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"agilelimiter"
+	"github.com/Yiming1997/agilelimiter"
 )
 
 // downstream is a toy model of a dependency. Below capacity it answers in

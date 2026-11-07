@@ -30,7 +30,7 @@ import (
 	"testing"
 	"time"
 
-	"agilelimiter"
+	"github.com/Yiming1997/agilelimiter"
 )
 
 const (

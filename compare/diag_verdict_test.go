@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"agilelimiter"
-	"agilelimiter/httpclient"
+	"github.com/Yiming1997/agilelimiter"
+	"github.com/Yiming1997/agilelimiter/httpclient"
 )
 
 // Temporary diagnostic: does the verdict actually change where the rate goes?

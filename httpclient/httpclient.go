@@ -38,7 +38,7 @@ import (
 	"strings"
 	"time"
 
-	"agilelimiter"
+	"github.com/Yiming1997/agilelimiter"
 )
 
 // Verdict decides what one call tells the controller. It is the only policy hook

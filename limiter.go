@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"agilelimiter/internal/simhook"
+	"github.com/Yiming1997/agilelimiter/internal/simhook"
 )
 
 // Anchor selects what the congestion threshold is measured against.

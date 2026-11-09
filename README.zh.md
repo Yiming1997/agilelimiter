@@ -1,6 +1,6 @@
 # agileLimiter
 
-[![CI](https://github.com/clearlove456/agilelimiter/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/clearlove456/agilelimiter/actions/workflows/ci.yml)
+[![CI](https://github.com/Yiming1997/agilelimiter/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Yiming1997/agilelimiter/actions/workflows/ci.yml)
 [![Go >= 1.20](https://img.shields.io/badge/go-%3E%3D1.20-00ADD8)](go.mod)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 

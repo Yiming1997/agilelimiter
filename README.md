@@ -4,6 +4,8 @@
 
 <h1 align="center">agileLimiter</h1>
 
+[中文文档](README.zh.md)
+
 <p align="center">
   Adaptive rate limiting for outbound dependencies, and adaptive concurrency
   limiting for inbound services.
@@ -216,8 +218,3 @@ More detail:
 ## License
 
 MIT. See [LICENSE](LICENSE).
-
-
-
-
-[中文文档](README.zh.md)

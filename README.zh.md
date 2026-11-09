@@ -1,5 +1,9 @@
 # agileLimiter
 
+[![CI](https://github.com/clearlove456/agilelimiter/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/clearlove456/agilelimiter/actions/workflows/ci.yml)
+[![Go >= 1.20](https://img.shields.io/badge/go-%3E%3D1.20-00ADD8)](go.mod)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+
 给**出站依赖**做自适应限速，给**入站服务**做自适应并发限制。
 
 `agileLimiter` 观察延迟，自动调整放行量。它是一个零依赖的小型 Go 模块：

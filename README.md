@@ -12,7 +12,7 @@
 </p>
 
 [![CI](https://github.com/Yiming1997/agilelimiter/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Yiming1997/agilelimiter/actions/workflows/ci.yml)
-[![Go >= 1.20](https://img.shields.io/badge/go-%3E%3D1.20-00ADD8)](go.mod)
+[![Go >= 1.24](https://img.shields.io/badge/go-%3E%3D1.24-00ADD8)](go.mod)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 `agileLimiter` watches latency and adjusts how much traffic to allow. It is a
@@ -30,7 +30,7 @@ to use the headroom above the floor without overwhelming the other side.
 go get github.com/Yiming1997/agilelimiter
 ```
 
-Requires Go 1.20 or newer. No external dependencies.
+Requires Go 1.24 or newer. No external dependencies.
 
 ## Outbound: call a dependency
 

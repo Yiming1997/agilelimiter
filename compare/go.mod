@@ -1,6 +1,6 @@
 module compare
 
-go 1.21
+go 1.24.0
 
 replace github.com/Yiming1997/agilelimiter => ../
 

@@ -1,7 +1,7 @@
 # agileLimiter
 
 [![CI](https://github.com/Yiming1997/agilelimiter/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Yiming1997/agilelimiter/actions/workflows/ci.yml)
-[![Go >= 1.20](https://img.shields.io/badge/go-%3E%3D1.20-00ADD8)](go.mod)
+[![Go >= 1.24](https://img.shields.io/badge/go-%3E%3D1.24-00ADD8)](go.mod)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 给**出站依赖**做自适应限速，给**入站服务**做自适应并发限制。
@@ -20,7 +20,7 @@
 go get github.com/Yiming1997/agilelimiter
 ```
 
-需要 Go 1.20+，无外部依赖。
+需要 Go 1.24+，无外部依赖。
 
 ## 出站：保护下游依赖
 

@@ -85,12 +85,10 @@ func (limiterPlugin) Options() []Option {
 		{Name: "initial", Default: "0", Help: "InitialRate; 0 derives MaxRate/8"},
 		{Name: "slo", Default: "100ms", Help: "SLOTarget; enables the tail guard"},
 		{Name: "tick", Default: "250ms", Help: "control-loop period"},
-		{Name: "fast-hl", Default: "0", Help: "FastHalfLife; 0 keeps the library default"},
 		{Name: "slow-hl", Default: "0", Help: "SlowHalfLife; 0 keeps the library default"},
 		{Name: "slow-down-hl", Default: "0", Help: "SlowDownHalfLife; 0 keeps the library default"},
 		{Name: "max-baseline-rise", Default: "0", Help: "MaxBaselineRise; 0 keeps the library default"},
 		{Name: "target-inflation", Default: "0", Help: "TargetInflation; 0 keeps the library default"},
-		{Name: "gain", Default: "0", Help: "proportional backoff gain; 0 keeps the default"},
 		{Name: "up-step", Default: "0", Help: "additive increase per tick; 0 keeps the default"},
 		{Name: "down-step", Default: "0", Help: "max fractional decrease per tick; 0 keeps the default"},
 		{Name: "slow-start-gain", Default: "0", Help: "multiplicative start gain; 0 keeps the default"},
@@ -137,10 +135,6 @@ func (limiterPlugin) Start(ctx context.Context, rt *Runtime, args []string) erro
 	if err != nil {
 		return err
 	}
-	fastHL, err := GetDuration(opts, "fast-hl", 0)
-	if err != nil {
-		return err
-	}
 	slowHL, err := GetDuration(opts, "slow-hl", 0)
 	if err != nil {
 		return err
@@ -154,10 +148,6 @@ func (limiterPlugin) Start(ctx context.Context, rt *Runtime, args []string) erro
 		return err
 	}
 	targetInflation, err := GetFloat(opts, "target-inflation", 0)
-	if err != nil {
-		return err
-	}
-	gain, err := GetFloat(opts, "gain", 0)
 	if err != nil {
 		return err
 	}
@@ -204,12 +194,10 @@ func (limiterPlugin) Start(ctx context.Context, rt *Runtime, args []string) erro
 			InitialRate:      initial,
 			SLOTarget:        slo,
 			Tick:             tick,
-			FastHalfLife:     fastHL,
 			SlowHalfLife:     slowHL,
 			SlowDownHalfLife: slowDownHL,
 			MaxBaselineRise:  maxBaselineRise,
 			TargetInflation:  targetInflation,
-			Gain:             gain,
 			UpStep:           upStep,
 			DownStep:         downStep,
 			SlowStartGain:    slowStartGain,
@@ -234,12 +222,10 @@ func (limiterPlugin) Start(ctx context.Context, rt *Runtime, args []string) erro
 			InitialLimit:     initial,
 			SLOTarget:        slo,
 			Tick:             tick,
-			FastHalfLife:     fastHL,
 			SlowHalfLife:     slowHL,
 			SlowDownHalfLife: slowDownHL,
 			MaxBaselineRise:  maxBaselineRise,
 			TargetInflation:  targetInflation,
-			Gain:             gain,
 			UpStep:           upStep,
 			DownStep:         downStep,
 			SlowStartGain:    slowStartGain,

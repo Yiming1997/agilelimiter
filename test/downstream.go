@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"math"
 	"math/rand/v2"
 	"strconv"
 	"strings"
@@ -32,12 +33,13 @@ type responder interface {
 	SLO() time.Duration
 }
 
-// capacityPhase is one stage of a capacity schedule: relative start (s),
-// duration (s), capacity (req/s). It mirrors the old sweep harnesses, which
-// changed capacity mid-run to force the controller to re-discover the knee.
-type capacityPhase struct {
+// capacityStep is one breakpoint of a capacity schedule: from startSec until
+// the next breakpoint, the origin capacity is capacity (req/s). A capacity of
+// zero means the origin is down for that span. The first step must start at
+// second 0, so the schedule is continuous by construction: there are no gaps,
+// no overlaps and no "before the first phase" case to get wrong.
+type capacityStep struct {
 	startSec int
-	durSec   int
 	capacity float64
 }
 
@@ -61,7 +63,7 @@ type downstreamParams struct {
 type downstreamModel struct {
 	Base              time.Duration
 	Capacity          float64
-	Phases            []capacityPhase
+	Steps             []capacityStep
 	Curve             func(float64) float64
 	CurveName         string
 	SLOValue          time.Duration
@@ -74,18 +76,23 @@ type downstreamModel struct {
 func (m *downstreamModel) SLO() time.Duration { return m.SLOValue }
 
 // capacityAt returns the origin capacity at elapsed, honouring the optional
-// phase schedule. Beyond the last phase the last capacity holds.
+// breakpoint schedule. Each step holds from its second until the next step;
+// the last step holds forever. A schedule with no steps is the constant
+// Capacity. The first step is required to be at second 0, so sec always
+// matches at least one step.
 func (m *downstreamModel) capacityAt(elapsed time.Duration) float64 {
-	if len(m.Phases) == 0 {
+	if len(m.Steps) == 0 {
 		return m.Capacity
 	}
 	sec := elapsed.Seconds()
-	for _, p := range m.Phases {
-		if sec >= float64(p.startSec) && sec < float64(p.startSec+p.durSec) {
-			return p.capacity
+	capacity := m.Steps[0].capacity
+	for _, s := range m.Steps {
+		if sec < float64(s.startSec) {
+			break
 		}
+		capacity = s.capacity
 	}
-	return m.Phases[len(m.Phases)-1].capacity
+	return capacity
 }
 
 // Respond models one request. The cache decision comes first because it
@@ -113,11 +120,18 @@ func (m *downstreamModel) Respond(offered float64, elapsed time.Duration, seq ui
 		}
 	}
 	capacity := m.capacityAt(elapsed)
-	missRate := offered * (1 - m.CacheHit)
-	var util float64
-	if capacity > 0 {
-		util = missRate / capacity
+	if capacity <= 0 {
+		// A zero-capacity step means the origin is down: the miss cannot be
+		// served, and like the origin-up=false case its latency is not a
+		// signal about queueing, so it is reported as Unreachable.
+		return response{
+			Dur:     m.OriginDownLatency,
+			Outcome: agilelimiter.Unreachable,
+			Good:    false,
+		}
 	}
+	missRate := offered * (1 - m.CacheHit)
+	util := missRate / capacity
 	d := time.Duration(float64(m.Base) * m.Curve(util))
 	return response{
 		Dur:     d,
@@ -146,7 +160,7 @@ func (downstreamPlugin) Options() []Option {
 		{Name: "cache-latency", Default: "1ms", Help: "latency of a cache hit"},
 		{Name: "origin-up", Default: "true", Help: "when false, misses fail as Unreachable"},
 		{Name: "origin-down-latency", Default: "500ms", Help: "round trip of a miss while the origin is down"},
-		{Name: "phases", Default: "", Help: "capacity schedule: startSec,durSec,capacity;... (semicolon separated)"},
+		{Name: "phases", Default: "", Help: "capacity steps: sec,capacity;... from 0; last holds (0 = origin down)"},
 	}
 }
 
@@ -160,6 +174,9 @@ func (downstreamPlugin) Run(ctx context.Context, rt *Runtime, args []string) err
 	capacity, err := GetFloat(opts, "capacity", 150)
 	if err != nil {
 		return err
+	}
+	if capacity < 0 || math.IsNaN(capacity) || math.IsInf(capacity, 0) {
+		return fmt.Errorf("option %q: must be a finite non-negative number", "capacity")
 	}
 	curveName := strings.ToLower(GetString(opts, "curve", "mm1"))
 	curve, err := curveFn(curveName)
@@ -189,13 +206,13 @@ func (downstreamPlugin) Run(ctx context.Context, rt *Runtime, args []string) err
 	if err != nil {
 		return err
 	}
-	phases, err := parseCapacityPhases(GetString(opts, "phases", ""))
+	steps, err := parseCapacitySteps(GetString(opts, "phases", ""))
 	if err != nil {
 		return err
 	}
 
 	model := &downstreamModel{
-		Base: base, Capacity: capacity, Phases: phases,
+		Base: base, Capacity: capacity, Steps: steps,
 		Curve: curve, CurveName: curveName, SLOValue: slo,
 		CacheHit: cacheHit, CacheLatency: cacheLatency,
 		OriginUp: originUp, OriginDownLatency: originDownLatency,
@@ -249,29 +266,52 @@ func pow8(u float64) float64 {
 	return u * u // u^8
 }
 
-// parseCapacityPhases parses "startSec,durSec,capacity;...". An empty string
-// means a single constant capacity (the model's Capacity field).
-func parseCapacityPhases(s string) ([]capacityPhase, error) {
+// parseCapacitySteps parses "sec,capacity;sec,capacity;...". Each entry is a
+// breakpoint: its capacity holds from that second until the next breakpoint,
+// and the last one holds forever. The first breakpoint must be at second 0, so
+// the schedule is always continuous. An empty string means a single constant
+// capacity (the model's Capacity field).
+//
+// Capacity 0 is allowed: it means the origin is down for that span. Negative,
+// NaN and infinite capacities are rejected.
+func parseCapacitySteps(s string) ([]capacityStep, error) {
 	if s == "" {
 		return nil, nil
 	}
-	var phases []capacityPhase
+	var steps []capacityStep
 	for i, seg := range strings.Split(s, ";") {
 		seg = strings.TrimSpace(seg)
 		if seg == "" {
 			continue
 		}
 		parts := strings.Split(seg, ",")
-		if len(parts) != 3 {
-			return nil, fmt.Errorf("phase %d: expected 3 comma-separated values, got %d", i, len(parts))
+		if len(parts) != 2 {
+			return nil, fmt.Errorf("phase %d: expected \"sec,capacity\", got %d fields", i, len(parts))
 		}
-		start, e1 := strconv.Atoi(strings.TrimSpace(parts[0]))
-		dur, e2 := strconv.Atoi(strings.TrimSpace(parts[1]))
-		capacity, e3 := strconv.ParseFloat(strings.TrimSpace(parts[2]), 64)
-		if e1 != nil || e2 != nil || e3 != nil {
-			return nil, fmt.Errorf("phase %d: invalid number", i)
+		sec, err := strconv.Atoi(strings.TrimSpace(parts[0]))
+		if err != nil {
+			return nil, fmt.Errorf("phase %d: invalid second %q", i, parts[0])
 		}
-		phases = append(phases, capacityPhase{startSec: start, durSec: dur, capacity: capacity})
+		capacity, err := strconv.ParseFloat(strings.TrimSpace(parts[1]), 64)
+		if err != nil {
+			return nil, fmt.Errorf("phase %d: invalid capacity %q", i, parts[1])
+		}
+		if sec < 0 {
+			return nil, fmt.Errorf("phase %d: second must not be negative", i)
+		}
+		if capacity < 0 || math.IsNaN(capacity) || math.IsInf(capacity, 0) {
+			return nil, fmt.Errorf("phase %d: capacity must be a finite non-negative number", i)
+		}
+		if n := len(steps); n > 0 && sec <= steps[n-1].startSec {
+			return nil, fmt.Errorf("phase %d: seconds must be strictly increasing (%d after %d)", i, sec, steps[n-1].startSec)
+		}
+		steps = append(steps, capacityStep{startSec: sec, capacity: capacity})
 	}
-	return phases, nil
+	if len(steps) == 0 {
+		return nil, nil
+	}
+	if steps[0].startSec != 0 {
+		return nil, fmt.Errorf("phases must start at second 0, e.g. \"0,150;4,60\" (got %d,...)", steps[0].startSec)
+	}
+	return steps, nil
 }

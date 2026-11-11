@@ -45,7 +45,7 @@ go run . --downstream base=20ms capacity=150 \
          --metrics interval=1s format=csv file=metrics.csv
 
 # 容量阶跃:先 150/s,后降到 60/s
-go run . --downstream base=20ms phases="0,4,150;4,6,60" \
+go run . --downstream base=20ms phases="0,150;4,60" \
          --load workers=256 settle=4s dur=6s
 
 # 用 preset + SLO 锚

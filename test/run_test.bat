@@ -9,7 +9,7 @@ go run . --downstream base=20ms capacity=150 --load workers=256 settle=3s dur=6s
 if errorlevel 1 exit /b 1
 
 echo === capacity step 150 -> 60 ===
-go run . --downstream base=20ms phases=0,4,150;4,6,60 --load workers=256 settle=4s dur=6s
+go run . --downstream base=20ms phases=0,150;4,60 --load workers=256 settle=4s dur=6s
 if errorlevel 1 exit /b 1
 
 echo === latency-first preset with an SLO anchor ===

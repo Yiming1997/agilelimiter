@@ -6,6 +6,13 @@ package main
 // one list makes the whole plugin set obvious. Adding a plugin means adding one
 // line here.
 //
-// The bare framework has no plugins yet; the concrete plugin files and their
-// registrations are added by the following change.
-var allPlugins = []Plugin{}
+// metrics/profile keep state across phases (Start parses and stores, End
+// reads), so pointer instances are registered.
+var allPlugins = []Plugin{
+	limiterPlugin{},
+	downstreamPlugin{},
+	loadPlugin{},
+	hcachePlugin{},
+	&metricsPlugin{},
+	&profilePlugin{},
+}

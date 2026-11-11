@@ -1,0 +1,6 @@
+# Harness build and run artifacts.
+test.exe
+*.prof
+metrics*.csv
+smoke_metrics.csv
+diag.csv

@@ -480,6 +480,151 @@ func TestLongTailDoesNotThrottleTheMajority(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// two more shapes: a cohort the SLO covers, and a slowdown that ends
+// ---------------------------------------------------------------------------
+
+// TestCohortInsideTheSLOCostsNothing is the safe side of the case above: one
+// request in three costs 120ms, which is 2.4x the base but still inside the
+// 150ms SLO. Nothing here breaks a promise, so the limiter must not back off at
+// all — a guard that reads a slow endpoint as congestion takes -30% a tick until
+// it reaches the floor, and minLimit is the only number that shows it.
+func TestCohortInsideTheSLOCostsNothing(t *testing.T) {
+	if testing.Short() {
+		t.Skip("end-to-end load test")
+	}
+
+	const (
+		rate    = 600.0
+		workers = 40
+		dur     = 5 * time.Second
+		slo     = 150 * time.Millisecond
+	)
+
+	cfg := tortureCfg()
+	cfg.TailTolerance = 0.05
+	w := workload{base: 50 * time.Millisecond, tailEvery: 3, tail: 120 * time.Millisecond}
+
+	var seq atomic.Int64
+	srv, client, lim := newService(cfg, w, &seq)
+	defer srv.Close()
+	defer lim.Stop()
+	lim.Start()
+
+	res := drivePaced(client, srv.URL, lim, rate, workers, dur)
+	res.label = w.label()
+	t.Logf("%s | SLO=%v initial limit=%d", res, slo, cfg.InitialLimit)
+
+	if res.minLimit < float64(cfg.InitialLimit) {
+		t.Errorf("limit dipped to %.0f from an initial %d: a cohort inside the SLO "+
+			"is being read as congestion", res.minLimit, cfg.InitialLimit)
+	}
+	if res.finalLimit <= float64(cfg.InitialLimit) {
+		t.Errorf("limit ended at %.0f, having started at %d: the cohort occupies "+
+			"slots longer, so the service needs more in flight, not less",
+			res.finalLimit, cfg.InitialLimit)
+	}
+	if got := res.shedPct(); got > 10 {
+		t.Errorf("shed %.1f%% of a %.0f req/s offer although every request is "+
+			"inside the SLO", got, rate)
+	}
+	if got := res.okPct(slo); got < 95 {
+		t.Errorf("only %.1f%% of a workload whose slowest request costs 120ms met a "+
+			"%v SLO", got, slo)
+	}
+	if res.ok200 < 500 {
+		t.Fatalf("only %d successful responses; the harness is broken, not the limiter",
+			res.ok200)
+	}
+}
+
+// TestSlowdownIsThrottledAndRecovered runs one limiter through healthy, then
+// every request 8x slower, then healthy again. The interesting failures are
+// symmetric and a fresh limiter per phase cannot see either: a limit that stays
+// up and absorbs load the service cannot serve, or one that collapses and never
+// comes back.
+func TestSlowdownIsThrottledAndRecovered(t *testing.T) {
+	if testing.Short() {
+		t.Skip("end-to-end load test")
+	}
+
+	const (
+		rate    = 600.0
+		workers = 40
+		slo     = 150 * time.Millisecond
+	)
+
+	cfg := tortureCfg()
+	cfg.TailTolerance = 0.05
+	var slow atomic.Bool
+
+	lim := agilelimiter.NewConcurrency(cfg)
+	handler := http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		if slow.Load() {
+			rw.Header().Set(tailHeader, "1") // every request is in the slow cohort
+			time.Sleep(400 * time.Millisecond)
+		} else {
+			time.Sleep(50 * time.Millisecond)
+		}
+		rw.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(rw, "ok")
+	})
+	srv := httptest.NewServer(httpserver.Wrap(handler, lim))
+	defer srv.Close()
+	defer lim.Stop()
+	lim.Start()
+
+	client := &http.Client{
+		Transport: &http.Transport{MaxIdleConns: 2000, MaxIdleConnsPerHost: 2000},
+		Timeout:   30 * time.Second,
+	}
+
+	phase := func(label string, isSlow bool, dur time.Duration) httpResult {
+		slow.Store(isSlow)
+		res := drivePaced(client, srv.URL, lim, rate, workers, dur)
+		res.label = label
+		t.Logf("%s", res)
+		return res
+	}
+
+	p1 := phase("healthy 50ms", false, 3*time.Second)
+	p2 := phase("slow 400ms", true, 3*time.Second)
+	p3 := phase("healthy again", false, 3*time.Second)
+
+	t.Logf("limit: %d -> healthy %.0f -> slow %.0f -> recovered %.0f (floor %d)",
+		cfg.InitialLimit, p1.finalLimit, p2.finalLimit, p3.finalLimit, cfg.FloorLimit)
+	t.Logf("429: healthy %.1f%% -> slow %.1f%% -> recovered %.1f%%",
+		p1.shedPct(), p2.shedPct(), p3.shedPct())
+
+	if p1.finalLimit <= float64(cfg.InitialLimit) {
+		t.Fatalf("limit stayed at %.0f over 3s of healthy traffic: nothing to lose",
+			p1.finalLimit)
+	}
+	if p2.finalLimit > 0.5*p1.finalLimit {
+		t.Errorf("limit was %.0f after 3s of 400ms requests, from %.0f while "+
+			"healthy: a load-independent slowdown is absorbed instead of throttled",
+			p2.finalLimit, p1.finalLimit)
+	}
+	if p2.finalLimit < float64(cfg.FloorLimit) {
+		t.Errorf("limit ended at %.0f, below the floor of %d", p2.finalLimit, cfg.FloorLimit)
+	}
+	if p3.finalLimit <= p2.finalLimit {
+		t.Errorf("limit stayed at %.0f after the latency returned to 50ms (%.0f "+
+			"before the slowdown): recovery is what makes throttling acceptable",
+			p3.finalLimit, p1.finalLimit)
+	}
+	if got := p3.healthyOkPct(slo); got < 90 {
+		t.Errorf("only %.1f%% of healthy requests met the SLO after recovery "+
+			"(before the slowdown: %.1f%%)", got, p1.healthyOkPct(slo))
+	}
+	for _, p := range []httpResult{p1, p2, p3} {
+		if p.ok200 < 100 {
+			t.Fatalf("phase %q answered only %d requests; the harness is broken, "+
+				"not the limiter", p.label, p.ok200)
+		}
+	}
+}
+
 func newOutboundService(t *testing.T, base, tail, slo time.Duration, initialRate int) (string, *http.Client, *agilelimiter.Limiter) {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {

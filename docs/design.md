@@ -1,456 +1,319 @@
-# 单进程出站自适应限流器设计
+# Adaptive Rate and Concurrency Limiting Design
 
-**目标**：保护下游依赖。用低开销、可预测的方式把发往下游的速率压到"下游还能健康服务"的水平，同时保留一个**可承诺的静态硬上限**。
+This document describes the current implementation, component boundaries, and main design trade-offs of agilelimiter. For usage examples, see [README](../README.md); for the protocol integration implementations, see [httpclient](../httpclient/httpclient.go) and [httpserver](../httpserver/httpserver.go).
 
-**约束（已确认）**
+## 1. Goals and Scope
 
-| 维度 | 选择 | 带来的设计后果 |
+agilelimiter periodically adjusts the request admission quota based on latency feedback, balancing throughput against latency within configured bounds.
+
+| Mode | Public type | Protected target | Quota unit | Admission behavior |
+|---|---|---|---|---|
+| Outbound rate limiting | `Limiter` | Downstream dependency | Requests per second | Blocks until the release instant |
+| Inbound concurrency limiting | `ConcurrencyLimiter` | The current service | Number of concurrently executing requests | Rejects immediately when no slot is available |
+
+Both modes share the controller, but enforce admission with a leaky bucket and a non-blocking semaphore respectively. Rate limiting constrains the interval between sends; concurrency limiting constrains the number of in-flight requests, preventing concurrency from accumulating as processing time grows.
+
+The scope is a single process. Multiple instances observe and adjust their quotas independently and do not coordinate a global budget. The project does not provide distributed rate limiting, an inbound wait queue, or a circuit breaker that stops calls entirely, nor does it guarantee a strict SLO attainment ratio.
+
+## 2. Overall Architecture
+
+### 2.1 Component Responsibilities and Dependencies
+
+| Component | Implementation | Responsibility |
 |---|---|---|
-| 作用方向 | 出站，保护下游 | 信号取下游 RTT；控制器感知的是**下游**的健康，不是本机负载 |
-| 作用范围 | 单进程/单机 | 无跨节点协调；每个副本各自自适应，全局总量 = 副本数 × 单机值 |
-| 观测信号 | 下游 RTT / 服务端耗时；从计划发送时刻计时 | 见 §2 的测量纪律 |
-| 硬上限 | 需要 | 静态 ceiling 独立于控制器强制生效 |
+| Protocol adapters | [httpclient/httpclient.go](../httpclient/httpclient.go), [httpserver/httpserver.go](../httpserver/httpserver.go) | Enforce admission, measure protocol call latency, and convert responses or errors into observations |
+| Public API and object assembly | [limiter.go](../limiter.go), [concurrency.go](../concurrency.go) | Process configuration, assemble the histogram, controller, and actuator, and manage the lifecycle |
+| Histogram | [histogram.go](../histogram.go) | Aggregate latency samples and emit per-tick quantiles, sample counts, and over-threshold counts |
+| Controller | [controller.go](../controller.go) | Maintain the baseline and control state, compute and clamp the target quota |
+| Outbound actuator | [bucket.go](../bucket.go) | Convert the target rate into a send interval and block until release |
+| Inbound actuator | [semaphore.go](../semaphore.go) | Acquire and release slots up to the target concurrency, rejecting without blocking when full |
 
----
+The protocol adapters depend on the public interfaces provided by the root package; the core controller does not depend on HTTP status codes or response structures. `Limiter` and `ConcurrencyLimiter` inject an actuator update function into the controller and apply new quotas through `setRate func(int)`.
 
-## 1. 核心思路：分层——漏桶当执行器，反馈当设定点
-
-漏桶擅长的是**"给定速率下，精确、平滑、低开销地放行"**；它不擅长**"决定速率应该是多少"**。把这两件事拆开，各用各的长处：
+`ConcurrencyConfig.toConfig()` maps the concurrency bounds onto the rate fields of the internal `Config`, reusing the defaulting, validation, and control algorithm. Consequently, in concurrency mode the internal `rate`, `Stats.Rate`, and the `*Rate` fields of `Resolved` denote a concurrency count, not a request rate.
 
 ```mermaid
-flowchart LR
-    A["下游 RTT 采样<br/>(从计划发送时刻计)"] --> B["信号处理<br/>快/慢 EWMA + 分位数"]
-    B --> C["控制器<br/>目标窗口 / AIMD"]
-    C --> D["clamp<br/>[R_min, R_max]"]
-    D --> E["漏桶执行器<br/>SetRate(R_dyn)"]
-    E --> F["实际发往下游"]
-    F -.->|响应耗时| A
+flowchart TB
+    A["Business call / HTTP adapter"] --> B["Limiter / ConcurrencyLimiter"]
+    B --> C["Admission actuator: bucket / semaphore"]
+    C --> D["Downstream call / handler execution"]
+    D --> E["Outcome classification and latency feedback"]
+    E --> F["histogram: latency samples"]
+    E --> G["controller: unreachable count and probe state"]
+    H["Background ticker"] --> G
+    F -->|"read and clear per tick"| G
+    C -->|"usage accounting"| G
+    G -->|"compute, clamp, and update the quota"| C
 ```
 
-- **执行层（actuator）** = 现有的 leaky bucket，速率设为 `R_dyn`。它把"要发多快"变成精确、平滑的节拍。
-- **决策层（controller）** = 反馈模型，根据 RTT 信号输出 `R_dyn`。
-- **硬上限** = `clamp(R_dyn, R_min, R_max)`，且**在 actuator 内部再兜一层**（见 §5）。控制器即便出 bug，也越不过 `R_max`。
+### 2.2 Request Path
 
-这么做直接命中漏桶的两个痛点：**"速率该定多少"不再靠猜**（控制器给），**"对下游健康一无所知"被补上**（RTT 反馈）。而漏桶原本的优点——平滑、低开销、可预测——全部保留。
+The outbound `Limiter.Do()` executes in the following order:
 
-> 关键点：**别把漏桶换掉，把它降级成"执行器"来用。**
+1. Call `Take()` and wait for the leaky bucket to release.
+2. Start timing and execute one business call synchronously.
+3. Classify and report the outcome, then return the business error.
 
----
+The inbound `ConcurrencyLimiter.Do()` first attempts to acquire a concurrency slot. On failure it returns `ErrOverloaded` without executing the callback; on success it starts timing, executes the business call, reports the outcome, and releases the slot with `defer`. If the callback panics, the slot is still released, but the subsequent outcome feedback is not executed.
 
-## 2. 测量：如何避免协调遗漏（Coordinated Omission）
+When calling `TryTake()` manually, each successful acquisition must be matched by exactly one `Release()`. The HTTP server adapter follows the same admission and release rules; requests rejected by the limiter are not recorded as handler latency samples.
 
-这是整个方案最容易翻车的地方，先讲。
+### 2.3 Background Control Path
 
-**问题**：如果你只测"请求实际发出 → 收到响应"的时间，那么当系统变慢时，你的发送循环也会跟着卡住、发得更少——于是**最慢的那段反而被采样得最少**，控制器看到的是"还行"，永远不降速，直到彻底崩溃。这就是协调遗漏。
+`New()` and `NewConcurrency()` only construct objects. `Start()` launches the background goroutine, and a `time.Ticker` calls `controller.step()` every `Tick`. The request path enforces admission and records observations; the background path aggregates and decides, so control computation does not run on every request.
 
-**做法**：从**计划发送时刻**计时。这正是本库 `Take()` 返回计划发牌时刻的价值所在：
+## 3. Observation Model
+
+### 3.1 Latency Measurement Discipline
+
+Controller inputs should represent the latency of the protected operation itself: outbound measures from the start of the actual call to its return, and inbound measures the handling time of an admitted request. Time spent waiting for outbound admission must not be included in the control signal; otherwise the waiting caused by a reduced rate could be misread as the downstream dependency becoming even slower.
 
 ```go
-t0    := rl.Take()          // 计划发送时刻（若被限流会阻塞到这里）
-start := time.Now()         // 实际发出
-resp, err := doRequest(ctx)
-done  := time.Now()
+started := time.Now() // Start of the end-to-end metric; choose as your application requires
+lim.Take()
+sent := time.Now()
+err := callDownstream()
+finished := time.Now()
 
-downstreamRTT := done.Sub(start)  // ① 纯下游信号：实际发出→响应
-coLatency     := done.Sub(t0)     // ② 用户体感：计划时刻→响应，含自身节流排队
+lim.ObserveOutcome(finished.Sub(sent), err) // Control signal
+endToEnd := finished.Sub(started)           // Includes this admission wait
+_ = endToEnd                               // Record it in your application's metrics system
 ```
 
-**两个指标的用途要分清：**
+`Take()` returns the scheduled release instant, not the time before entering the admission wait. Timing from that return value does not include the full admission wait, nor does it automatically eliminate coordination omission. When fixed workers are saturated by slow requests, requests that are never sent produce no samples; to evaluate latency as defined by an external arrival schedule, the application or load generator should record the arrival schedule and wait time independently.
 
-- **驱动控制器用 ① `downstreamRTT`**。它是"下游自己花了多久"的干净信号。**不要拿 ② 喂控制器**——`coLatency` 里含着你自己的限流排队：你越是收紧速率，`coLatency` 越高，控制器就会进一步收紧……形成**自反馈跑飞**，一路掉到 `R_min`。这是 latency 驱动限流器最常见的死法之一。
-- **② `coLatency` 只用于 SLO 观测/报表**，它才是用户真正体感、且 CO 安全的口径。
+The HTTP client adapter measures the execution time of the underlying `RoundTrip()` and excludes subsequent response body reads; the server adapter measures the time from `ServeHTTP()` to return. Long-lived connections, streaming responses, and ordinary short requests have different latency semantics and should be given separate budgets or observation policies.
 
-**采样纪律**（比公式更重要）：
+Each sample should correspond to one actual attempt. Retries must enforce admission and report feedback once per attempt, rather than treating the total time of several attempts as a single call latency. Results that do not represent the target resource's processing capacity — cache hits, health checks, local rejections — should be classified before feedback; operations with different latency distributions should preferably use separate instances.
 
-1. **别让采样停摆**。如果发送由固定数量的 worker 驱动，下游一变慢 worker 就被占满、`Take()` 都调不到，此刻你其实已经"少发了"。要么保证持续按计划节奏投递，要么把这"本该发却没发"的 stall 按计划时刻计入——否则又是 CO。
-2. 采样丢弃要计数（channel 满、背压），丢了多少心里要有数。
+### 3.2 Outcome Classification
 
----
+`Outcome` describes what a result means to the controller; it is not equivalent to business success or failure.
 
-## 3. 控制器：快/慢 EWMA 基线对比 + 分位数
-
-### 3.1 信号处理
-
-对 `downstreamRTT` 维护几条统计量：
-
-- **`fast`**：快速 EWMA（半衰期 ~2–5s），反映**当前**状况。
-- **`slow`**：慢速 EWMA（半衰期 ~30–60s），作为**健康基线**。
-- **分位数**：滑动窗口（~30–60s）的 `p50` 与 `p99`。用固定对数直方图（每周期原子桶计数后复位）即可，零分配。
-
-**比较要"同类比同类"**，避免量纲错配：
-
-- **控制器主信号**：`p50` vs `slow(p50)` —— 中位数抬升是**最干净的拥塞信号**。
-- **p99 作守卫**：`p99` 用于尾延迟安全带，越过 SLO 时无论主信号如何，直接乘性下压。
-
-### 3.2 调节律（本项目落地实现）
-
-核心是一个**目标窗口 + AIMD**：
-
-```text
-high ← slow · (1 + TargetInflation)      // 可容忍的延迟上界
-low  ← high · (1 - Deadband)             // 上界之下再留死区
-
-若 p50 ≤ low             → R_dyn ← min(R_dyn·(1+UpStep),  R_max)          // 健康：加性增（探测）
-若 p50 ≥ high            → R_dyn ← max(R_dyn·(1-DownStep), R_min)         // 拥塞：固定降
-否则（死区内）           → R_dyn 不变                                     // 保持
-尾延迟守卫: 若 p99 > SLO → R_dyn ← max(R_dyn·(1-DownStep), R_min)         // 无视主信号，直接下压
-```
-
-**关键点**：不是拿 `p50` 和"空闲基线"直接比，而是允许延迟在基线之上抬升 `TargetInflation` 倍——**容忍一定排队**才不会一有排队就收手、把利用率压到极低。`TargetInflation = 1.0` 表示"容忍到 2× 基线"。这也正是 Netflix Gradient2 里 queue-size target 的思路。
-
-**非对称是关键**：**降得快、升得慢**（固定减 `DownStep=0.30`、加性增 `UpStep=0.05`）。既对下游友好（一旦苗头不对立刻收手），又能避免在拐点附近来回震荡时反复冲击下游。
-
-**死区/迟滞**：`low < p50 < high` 之间不动作，滤掉噪声导致的抖动。
-
-> 备注：设计早期还考虑过纯梯度律 `R_dyn ← R_dyn·(slow/fast)^γ`，但它缺少"容忍排队"的目标点，容易在低利用率处锁死；最终采用上面的目标窗口律。
-
-### 3.3 稳定性旋钮（按重要性）
-
-1. **慢信号 / 长半衰期**——越慢越稳，但越滞后。这是"慢速 EWMA"的全部意义。
-2. **单周期变化上限**——无论公式算出多少，每周期 `R_dyn` 变化不超过 ±x%（如 20%），防止阶跃。
-3. **死区**（§3.2）。
-4. **步长 `UpStep`·`DownStep`**——调大响应快但易振荡。
-
-### 3.4 ⚠️ 最重要的一条：**基线不能被拥塞污染**
-
-如果用 `slow` 当基线，而下游**长时间**处于拥塞，`slow` 会慢慢爬向拥塞值 → `slow/fast → 1` → 控制器**停止降速，卡在拥塞态出不来**。这是 latency 驱动控制器的头号暗坑。对策（至少做一条）：
-
-- 基线取**低位分位数**或"近期最小值"的慢速平滑，而非均值/中位数——它代表"健康时的样子"。
-- 限制基线每单位时间**向上的漂移速度**。
-- **周期性向下探测**：偶尔小幅降速，看延迟是否随之改善，以验证"现在真的没余量"还是"基线被污染了"。
-- 外部事件（发版、下游重启、错误率跳变）时**重置基线**。
-
----
-
-## 4. 与现有代码的集成
-
-### 4.1 执行器：给 `atomicInt64Limiter` 加 `SetRate`
-
-现有 `limiter_atomic_int64.go` 里 `perRequest` 和 `maxSlack` 是普通字段。改成原子，运行时热更新：
-
-```go
-type adaptiveAtomicInt64 struct {
-    prepadding  [64]byte
-    state       int64 // 下次放行时刻（unix ns），与速率无关
-    postpadding [56]byte
-    perRequest  int64 // atomic ns
-    maxSlack    int64 // atomic ns（负数）
-    clock       Clock
-}
-
-func (t *adaptiveAtomicInt64) SetRate(rate int, per time.Duration, slack int) {
-    pr := int64(per / time.Duration(rate))
-    atomic.StoreInt64(&t.perRequest, pr)
-    atomic.StoreInt64(&t.maxSlack, -int64(slack)*pr)
-}
-```
-
-`Take()` 里把 `t.perRequest` / `t.maxSlack` 换成 `atomic.LoadInt64(...)` 即可。
-
-**为什么改速率不会引起突发或卡顿**：`state` 存的是**绝对时刻**，与速率无关；改速率只影响下一次的**增量** `state + perRequest`。所以热更新**天然不重置状态**，是无缝的。（唯一提醒：自适应场景把 `slack` 设小——slack 的突发缓冲会削弱控制器对速率变化的响应锐度。）
-
-### 4.2 包装与热路径
-
-```go
-type AdaptiveLimiter struct {
-    inner *adaptiveAtomicInt64 // 执行器
-    // 采样用原子/无锁，热路径零分配
-    hist  *logHistogram        // 分位数（原子桶）
-}
-
-func (a *AdaptiveLimiter) Take() time.Time { return a.inner.Take() }
-
-// 调用方在请求前后喂样本：
-func (a *AdaptiveLimiter) Observe(rtt time.Duration) { a.hist.Record(rtt) }
-```
-
-### 4.3 控制循环
-
-独立 ticker（如每 1s）跑控制逻辑，与热路径解耦：
-
-```go
-func (c *Controller) loop() {
-    tk := time.NewTicker(c.tick)          // 1s
-    for range tk.C {
-        sig := c.hist.SnapshotAndReset()   // 取本周期 p50/p99（原子桶，复位）
-        c.updateEWMA(sig)                  // fast / slow / 基线
-        next := c.adjust()                 // §3.2 的梯度或 AIMD
-        next = clamp(next, c.minR, c.maxR) // 硬上限（第一层）
-        c.rate.Store(next)
-        c.inner.SetRate(int(next), c.per, c.slack)
-    }
-}
-```
-
-热路径只做一次 `Record`（一个原子加），零锁零分配。
-
----
-
-## 5. 硬上限与兜底（防御纵深）
-
-硬上限要在**两层**独立生效，任何一层出问题都不会突破：
-
-1. 控制器输出后 `clamp(R_dyn, R_min, R_max)`。
-2. actuator 自身：即使被喂了超过 `R_max` 的速率，也不越界。
-
-`R_max` 就是你要求承诺的那个静态值（合同/配额）。`R_min` 建议留一小股**探测流量**（不为 0），这样下游恢复时能立刻被感知。
-
-**强烈建议再加一条错误/超时兜底**（即使你没勾这个信号）：RTT 只反映"慢"，不反映"贵"——下游**直接报错/超时**时，延迟样本可能看起来正常。连续超时 → 直接打到低位，这是安全阀，和延迟信号并行工作。
-
-**冷启动**：没有基线时**从低速起步、慢慢爬升**（对下游友好），而不是从 `R_max` 往下退——后者在启动瞬间就可能压垮下游。
-
----
-
-## 6. 陷阱清单（按踩坑概率排序）
-
-1. **协调遗漏**——测量纪律，见 §2。
-2. **基线被拥塞污染**——长时间过载后卡死，见 §3.4。
-3. **自反馈跑飞**——把含自身节流的端到端延迟喂回控制器，见 §2。
-4. **进入震荡**——调增益/死区/单步上限；用非对称（慢升快降）。
-5. **快慢不匹配**——慢基线滞后，突发事件需要**快速信号**（如 p99 守卫、错误率）做安全阀。
-6. **单信号局限**——RTT + 错误率一起看；只看 RTT 会漏掉"快速失败"。
-7. **黑盒化**——必须暴露 `R_dyn / R_min / R_max / baseline / fast / p99 / 升降事件计数`。一个不可观测的自适应限流器，出事时无法复盘。
-
----
-
-## 7. 验证方法
-
-- **确定性单测**：本仓库已经依赖 `github.com/benbjohnson/clock`（mock 时钟）和 `go.uber.org/atomic`——直接拿来做无 flaky 的控制器测试。喂入**构造好的 RTT 序列**（健康→阶跃变慢→恢复），断言 `R_dyn` 的轨迹：能爬升、遇拥塞及时回退、永不超 `R_max`、恢复后能回升。
-- **阶跃/混沌测试**：下游 RTT 突增，测量"多快回退到安全值"；恢复后测量"多快爬回 `R_max`"。
-- **不变量测试**：任意序列下 `R_min ≤ R_dyn ≤ R_max` 恒成立。
-- **CO 验证**：构造"下游变慢导致采样变少"的场景，确认控制器**仍然**能降速。
-
----
-
-## 8. 一句话总结
-
-**把 `R_dyn` 交给 `Take()` 之外的另一个循环来计算，让漏桶只负责按这个速率平滑放行。** 决策来自"快 EWMA 对比慢 EWMA 基线"（配 p99 守卫、错误兜底），执行复用手上的 leaky bucket，硬上限在控制器和执行器两层强制。测量是一切的地基——**必须从计划发送时刻计时，且采样不能在变慢时停摆**。
-
-## 9. 锚点：相对基线 vs 绝对 SLO（实现补充）
-
-对应代码里的 `Config.Anchor` 与 `Config.BackoffTicks` / `RecoverTicks`。
-
-### 9.1 相对锚点的固有缺陷
-
-阈值 `high = slow·(1+TargetInflation)`，再取 `min(high, 0.8·SLO)`。
-注意 `min()` 是**单向**的：SLO 只能把窗口压低，永远不能抬高。
-所以基线一小、SLO 一宽松，SLO 就完全不参与决策，实际目标变成
-“最快观测延迟的 2 倍”：
-
-```text
-baseline 20ms, SLO 200ms  ->  high = min(40ms, 160ms) = 40ms
-```
-
-### 9.2 病态表现：健康但变慢，也会掉到地板
-
-20ms → 50ms（只占 SLO 的 1/4，但已是 2.5× 基线）→ 判为拥塞 → 每拍 -30% → 打到
-`MinRate`。而且很难自己爬出来：基线只能按 `MaxBaselineRise`（默认 0.2%/拍，
-约 12%/分钟）上浮，回升只能 `+UpStep`（5%/拍），`coldStart` 也不再重置。
-虚拟时钟实测（`TestBaselineAnchorCollapsesOnBenignRise`）：500 → 10 req/s 用 11 拍，
-回到 500 要 218 拍。
-
-这类“外生变慢”在线上很常见：下游发版、网络路径变化、GC 参数调整、缓存变冷、
-响应体变大。它们和排队的信号**完全一样**，区别只在于“压速到底有没有用”。
-
-### 9.3 绝对锚点
-
-`AnchorSLO`：`high = 0.8·SLOTarget`，与基线无关。基线仍然维护（`Stats`、
-`outageSample` 还在用），但不再决定降速；p99 尾延迟守卫保留。
-
-代价：SLO 有富余时会一直往上探，找不到低于 SLO 的拐点。适用于“下游有明确延迟
-目标、且在目标内能优雅退化”的场景。
-
-实测（`compare`，20ms → 70ms，SLO 100ms，容量 150/s，跑 20s）：
-
-| | 完成/s | 满足 SLO/s | 最终速率 |
-|---|---:|---:|---:|
-| uber 固定 100/s | 102 | 102 | 100 |
-| 相对锚点 2×（`PresetBalanced`） | 48 | 48 | **5** |
-| 相对锚点 3.5× | 99 | 99 | 112 |
-| 绝对锚点 `AnchorSLO` | 99 | 99 | 109 |
-
-容量真掉（150→40/s）时反过来：固定速率没有任何防御（均值 619ms，仅 40% 达标），
-绝对锚点收在 ~39/s、83% 达标。
-
-### 9.4 时间迟滞
-
-`BackoffTicks` / `RecoverTicks`：连续 N 拍同侧才动作（CoDel 的 interval 简化版）。
-默认 `AnchorBaseline` 1/1（保持原行为），`AnchorSLO` 2/2。
-
-为什么不能只靠 EWMA 平滑：步长不对称（-30% / +5%），噪声不会相互抵消，
-而是把速率**棘轮式**往下拽。死区内的一拍会同时清零两个计数器，
-所以要求的是“连续”而不是“累计”。
-
-### 9.5 选型
-
-| 你的处境 | 建议 |
-|---|---|
-| 下游是自己可控的服务、有明确 SLO | `AnchorSLO` |
-| 下游在 SLO 之前就有明显拐点 | `AnchorBaseline`，并把 `MaxRate` 设在拐点 |
-| 信号噪声大（低流量、样本少） | 两种锚点都配 `BackoffTicks >= 2` |
-
-### 9.6 快速恢复：做了，量了，删了
-
-问题是真的：`coldStart` 用过就不重置，深跌后只能 `+UpStep`。5 → 120 要
-`ln(24)/ln(1.05) ≈ 65` 拍，而跌下去只用了十来个拍——**恢复比故障本身还慢**。
-矩阵里这是自适应方案唯一明确输给固定速率的地方（容量 40 → 150/s：自适应 25，
-`uber(140)` 98）。
-
-所以实现过：当观测延迟 ≤ 容忍窗口一半时，重新允许乘性探测（相当于“知道拐点在哪
-且离得很远”）。实测（2× 锚点，2 轮均值）：
-
-| 场景 | 关闭 | 开启 |
-|---|---:|---:|
-| 容量恢复 40→150/s | 25 | **52** |
-| 容量跌 150→40/s | 59 | **46** |
-
-**然后删掉了。** 理由是：倍增也是越界的来源。刀锋型容量曲线下 2 倍过冲会把延迟
-直接顶到 1s，而 AIMD 的小步长恰恰擅长贴着这种拐点——恢复赢了 27，容量下跌输了
-13，而“容量下跌时不要雪上加霜”是这类限流器的第一职责。
-
-试过的折中方案也没救回来：加 4 拍驻留（要求延迟连续多拍低于半窗口）在矩阵里几乎
-无差异（46 → 46），因为真实 cohort 的低延迟同样能持续好几拍。
-
-**所以现在的行为是：深跌后的回升就是 `+UpStep`，慢，但不会二次伤害。** 真需要更快
-恢复时，正确的做法是在应用层做（记住上次的好速率、重启后从那个值起步），而不是
-在控制器里加一个“条件性激进”的开关。这条作为设计记录保留，避免以后又有人把它
-加回来。
-
-### 9.7 预设与配置可见性
-
-20 个字段里有 17 个有默认值，但“有默认值”不等于“用户知道它被怎么设的”。
-所以补了四件事：
-
-- **`Config.Preset`**：把策略类字段（`Anchor` / `BackoffTicks` / `RecoverTicks` /
-  `TargetInflation`）折进三个命名预设，只填空值，显式值优先。预设之间最多差
-  3~4 个字段——差得更多就不叫预设，叫另一台机器。
-- **不推导 `Tick` 与半衰期**：它们规定的是控制律的时间尺度。改 `Tick` 等于把所有
-  “每拍”的增益重新标定一遍，静默推导会让用户以为只改了一个数。
-- **`Config.Validate()`**：把以前 8 条静默修复改成可显式拒绝（`MinRate > MaxRate`、
-  `AnchorSLO` 无 `SLOTarget`、`Deadband >= 1` 等）。`New` 签名不变——库在升级时
-  开始返回 error 会一次性打断所有调用方。
-- **`Limiter.Config() → Resolved`**：打印解析后的完整配置，包括“要了 SLO 锚点但
-  没给 SLO，实际跑的是相对锚点”这种情形。不能直接打印 `Config`，因为它带着
-  两个函数字段。
-
-### 9.8 默认策略：有 SLO 时用 SLO 锚点 + 5% 尾部容忍
-
-`PresetNone`（零值）不再等于 `PresetBalanced`：配了 `SLOTarget` 时，它等于
-`PresetLatencyFirst` 再加 `TailTolerance = 0.05`；没配 `SLOTarget` 时仍是相对锚点。
-命名预设的含义一律不变，`PresetBalanced` 就是旧默认值，想固定旧行为就指定它。
-
-依据是真实流量仿真（`sim/realistic_test.go`：多接口混合、重尾延迟、重试、缓存命中、
-4xx/5xx、150 分钟事故时间线）里，旧默认的三个问题都出在“相对基线”和“单拍 p99”上：
-
-| 问题 | 原因 | 新默认 |
+| Outcome | Feedback behavior | Typical meaning |
 |---|---|---|
-| 正常时段误挡 6–25% 的请求 | 单拍 p99 被 GC 停顿、慢接口的长尾触发 | 比例守卫区分“一小撮慢”与“整拍慢” |
-| 便宜接口占比在 50% 附近漂移时吞吐减半 | p50 在两类接口之间跳，基线被拉低 | SLO 锚点不看基线 |
-| 一段快样本（扫描器 404、0 值）后在地板卡几十分钟 | 基线降得快、升得慢的棘轮 | 同上 |
+| `Reached` | Clears probe state and records the actual latency | A meaningful call latency was obtained, including partial errors and timeouts |
+| `Unreachable` | Calls `Unavailable()`, incrementing the unreachable count and entering probe state | Connection failure, open circuit breaker, or otherwise deemed unserviceable by the adapter |
+| `Aborted` | Usually records no latency | Cache hit, invalid observation, or caller cancellation |
 
-全程 goodput（出站 / 入站）281 / 820，旧默认 256 / 707，按正常峰值调好的固定速率
-282 / 841。
+The generic `Do()` and `ObserveOutcome()` call `Config.Classify` only when the error is non-nil. By default, `context.Canceled` is classified as `Aborted` and every other result as `Reached`, including `context.DeadlineExceeded`. A custom classifier can override the default error classification.
 
-代价是真实存在的，记录在这里：
+The latency of a canceled request is a lower bound on the full latency. `ObserveTruncated(d)` records that lower bound only when `SLOTarget` is configured and `d > SLOTarget`, so slow requests already known to be over the line are not discarded; it does not clear probe state. The generic path applies this handling to cancellation errors classified as `Aborted`; the HTTP adapters handle cancellation before the custom `Verdict`.
 
-- **更贴着 SLO 跑**：p50 瞄准 0.8·SLO，比例守卫允许约 5% + 3σ 的请求超线；
-  直方图按桶下界计数，超线数会少算最多一个桶，干净下游上实测有 4–13% 的请求
-  超过 SLO（旧默认约 1%）。
-- **保护更松**：同一条事故时间线上过载 320s / 34s，旧默认 7s / 8s
-  （固定速率 1214s / 829s）。
-- **会被大比例未过滤的快样本稀释**：比例守卫看的是“超线请求的占比”，快样本占到
-  1 − 容忍度以上（例如没打标的缓存命中占 95%）时，真实请求的占比低于容忍度，
-  守卫看不见。旧默认的 p99 守卫要到 99% 才失明。
+The HTTP adapters use a separate `Verdict`, customizable through `WithVerdict`, which does not go through `Config.Classify`:
 
-试过在比例守卫之外再加一个“p99 超过 k·SLO 也降速”的兜底：3×、5×、10× 三档
-都只能部分挡住 95% 假快样本，却让每拍不足 100 个样本时任何一个超过阈值的离群值
-都能触发降速（0.5% 的 10s 离群值就把速率压到 12），等于把比例守卫修掉的问题
-又带回来。“95% 快样本 + 5% 真实慢请求”和“5% 的离群值”在一拍的分布上无法区分，
-所以没有加。快样本该在接入层过滤（Verdict），过滤不了的场景固定 `PresetBalanced`。
+- The client classifies `net.OpError` during connection establishment, HTTP 429, and all 5xx as `Unreachable`, and recognized cache hits as `Aborted` by default.
+- The server classifies HTTP 429, 502, 503, and 504 as `Unreachable`, and other 4xx responses and cache hits as `Aborted` by default; 500 keeps the actual handling latency by default.
 
+These policies belong to the adapter layer. The core controller is not responsible for inferring whether a particular error or status code indicates insufficient capacity.
 
-## 10. 信号卫生：什么不该进入样本
+### 3.3 Per-Tick Statistics and Precision
 
-§9 讨论的是“时长应该受哪套策略管”，本节讨论“这个时长到底有没有在测下游”。
-控制器只有一个输入，也分不清有意义的样本和误导性的样本，所以
-`compare/pollution_test.go` 把代价量了出来。所有对照组的下游都是**平的**
-（延迟与速率无关），因此任何降速都必然是误判。
+The `histogram` uses a fixed-size logarithmic histogram with 256 buckets, each power-of-two range split into 4 sub-buckets. Records use atomic counters; a snapshot reads and clears each bucket, computing `p50`, `p99`, the sample count `n`, and the number of tail-latency samples over the threshold `above`. It aggregates samples between adjacent snapshots and does not maintain a sliding window across ticks.
 
-| 样本流 | 对照 | 污染后 | 发生了什么 |
-|---|---:|---:|---|
-| 80% 请求 1ms（缓存命中） | 135/s | 136/s | 无伤害：miss 路径压不饱和 |
-| 5% 请求恒定 300ms | 136/s | **54/s** | 尾守卫把“固定的慢总体”读成拥塞 |
-| 内部重试一次（样本 ×2） | 135/s | **24/s，0% 达标** | 绝对比较拿到的是两倍真实延迟 |
-| 本地开销 +20ms（未越 `SLOTarget`） | 136/s | 136/s | 无伤害：窗口和信号一起平移 |
-| 本地开销 +50ms（越过 `SLOTarget`） | 135/s | **24/s，0% 达标** | 同样的污染，这次触发了守卫 |
+Quantiles use nearest-rank, that is `ceil(q × n)`, returning the lower bound of the target bucket, so there is downward quantization error — roughly no more than 20% within typical ranges. The tail count includes only buckets whose lower bound is strictly greater than the threshold; a bucket containing the threshold is excluded, which may undercount over-threshold samples.
 
-三条结论：
+Snapshots and records may proceed concurrently, but the per-bucket swap is not a globally atomic snapshot, so tick boundaries are approximate. These statistics suit feedback control and should not replace precise SLO reporting.
 
-1. **相对窗口会自我校正，尾守卫不会。** 在每一个速率触底的场景里，中位数判决都是
-   “健康”——常数偏移让 `fast` 和 `slow` 一起动，比值不变；而绝对比较会命中，
-   并且一次就是 `-30%/拍` 一路砍到 `MinRate`。
-2. **尾守卫比的是“单拍 p99 vs `SLOTarget`”。** SLO 是长窗口的比例（“99% 在
-   200ms 内”），而单拍 p99 越过这个数，对一个“刚好达标”的服务是**常态**
-   （大约一半的拍）。而一半的拍就足够把速率拖到地板（`0.70 × 1.05 < 1`）。实测：
-   完全无排队的下游上，5% 请求恒定 300ms 就把 300 req/s 打成 21。
-   这就是 `TailFactor` 存在的理由：它只移动守卫阈值，不动窗口天花板和 `AnchorSLO`
-   的目标。默认 1.0（对着 SLO 开火，即历史行为），当长尾来自“不同请求类型”
-   而不是“排队”时，建议设 1.5~2.0，而 `SLOTarget` 继续写契约上那个数。
-3. **本地开销本身无害，越线才致命。** `+20ms` 零伤害，`+50ms` 从 300 掉到 5。
+## 4. Control Algorithm
 
-### 10.1 比例模式（`TailTolerance`）
+Below, `R` denotes the target quota: requests per second for outbound and concurrent requests for inbound. The controller keeps a floating-point value internally and rounds it to an integer before applying it to the actuator.
 
-上面的结论直接推出一个改法：既然问题在于“一个次序统计量 vs 一条绝对红线”，那就
-换成“**这一拍有多少比例超线**”。`TailTolerance > 0` 时启用：
+### 4.1 Per-Tick Processing Order
 
-```go
-ratio := above / n                      // 本拍超线比例
-over  += α * (ratio - over)             // 半衰期 ~2 拍的 EWMA，滤掉单拍尖峰
+`controller.step()` executes the following in order under a mutex:
 
-// 容忍度是“政策”，余量是“证据”：
-// σ = sqrt(tol(1-tol)/n) · sqrt(α/(2-α))，后者是 EWMA 对方差的压缩
-if over > tol + 3σ {
-    factor = 1 - DownStep               // 固定降（幅度固定，是否开火由证据决定）
-}
+1. Judge whether this is an outage tick from the unreachable count, and inject a synthetic sample if necessary.
+2. Read and clear the histogram and usage statistics, and update the per-tick observation metrics.
+3. Return without adjusting the quota when the sample count is zero; on the first non-empty tick, initialize the baseline and return.
+4. Update the latency baseline, compute the control window, and determine the adjustment factor from the median.
+5. Apply tail-latency protection and outage fallback, clamp the quota, and update the actuator.
+
+Empty ticks do not reset the median hysteresis counters, nor do they update the smoothed tail ratio. The first non-empty tick may include a synthetic sample and likewise performs no adjustment after initialization.
+
+### 4.2 Latency Baseline
+
+The current tick's `p50` is used directly as the primary signal, stored in `Stats.Fast`; there is no separate fast EWMA. The baseline `B` uses an asymmetric exponentially weighted moving average:
+
+```text
+alpha(H) = 1 - 2^(-Tick / H)
+
+p50 < B:
+    B ← B + alpha(SlowDownHalfLife) × (p50 - B)
+otherwise:
+    delta ← min(alpha(SlowHalfLife) × (p50 - B), B × MaxBaselineRise)
+    B ← B + delta
 ```
 
-**关键是那个 `3σ`**：调用方只声明“我接受多少比例的慢请求”，至于“多少才算不是噪声”
-由控制器根据**它实际拿到的样本数**推出来。所以忙碌的服务余量小、冷清的服务余量大
-——冷清的服务本来就测不准。这就取消了“容忍度要取 cohort 的两倍”这类民间经验。
+By default `SlowHalfLife = 45s`, `SlowDownHalfLife = SlowHalfLife / 9`, and `MaxBaselineRise = 0.002`. The baseline follows improvements quickly, absorbs persistent slowdowns slowly, and limits how much congestion can raise it. The baseline is not a historical minimum, and no interface is provided for actively resetting it or for periodic probe-based shedding.
 
-反过来，把余量删掉、只比裸 `tol` 是不成立的：cohort 在**每一拍**都占固定比例，所以
-“5% 的请求慢”在每一拍都读作“5% 超线”，任何抖动都会持续开火。实测同一场景
-（`tol = 5%`，正好等于 cohort 占比）最终速率从 300 被打到 26，而加上余量后回到 300。
-`compare` 里的 `TestTailMargin` 是这条结论的数据出处：加余量后 8~9/9 格 held，
-不加时只有 3/9；`Stats().TailThreshold` 会打印出推导出来的阈值本身——每拍
-24~32 个样本时它在 0.095~0.116，而观测比例在 0.030~0.063 之间摆动。
+### 4.3 Control Window and Anchors
 
-实测（延迟与负载无关的下游，5% 请求恒定 300ms，`tol = 5%`）：
+The window's upper bound is `high` and its lower bound is `low = high × (1 - Deadband)`, with `Deadband = 0.05` by default.
 
-| 设置 | 完成/s | 最终速率 |
-|---|---:|---:|
-| `tol 0`（p99 测试） | 54 | **21** |
-| `tol 5%` | 136 | **300** |
-| `tol 10%` | 135 | 300 |
-
-“每个请求都是 300ms”时三档都仍然把速率打到 `MinRate`（25/s，0% 达标）——保护能力没丢。
-
-修法统一在接口层：**在样本进入 `Observe` 之前决定它代表什么**。
-
-| 样本可能是 | 怎么办 |
+| Anchor | Window upper bound |
 |---|---|
-| 缓存命中 / 健康检查 / 预检 | 判 `Aborted`，不进信号 |
-| 另一个端点（有自己的延迟画像） | 单独一个 limiter，不要把两个总体平均进一个 p50 |
-| 重试的一次尝试 | 用 `Take`/`Observe` 按单次尝试上报，不要用 `Do` |
-| 本地开销（序列化、锁、GC） | 只测调用本身；注意它吃掉的是 SLO 余量 |
-| 被**自己的** deadline 截断的尝试 | 保证 deadline > `SLOTarget`；短于它，样本被削平，限流器在 deadline 之上失明 |
+| `AnchorBaseline`, no SLO | `B × (1 + TargetInflation)` |
+| `AnchorBaseline`, with SLO | `min(B × (1 + TargetInflation), 0.8 × SLOTarget)` |
+| `AnchorSLO`, with SLO | `0.8 × SLOTarget` |
 
----
+The baseline anchor backs off based on relative latency change and needs no SLO, but it may judge a persistent slowdown caused by external factors — such as a change in the network path — as congestion. The SLO anchor allows latency to vary within a fixed target window, but it will not identify a capacity knee below that window. The baseline is still maintained under the SLO anchor, for observability and synthetic outage samples.
 
-## 参考
+If `AnchorSLO` is requested without a `SLOTarget`, runtime logic falls back to the baseline anchor; `Validate()` can report this configuration problem, and `Config()` shows the actual fallback.
 
-- Netflix `concurrency-limits`（Gradient / Vegas：短 RTT EWMA 对比长 RTT EWMA）
-- TCP Vegas / BBR（延迟驱动的拥塞控制）
-- AIMD（Jacobson 的 TCP 拥塞控制）
-- CoDel（基于排队延迟的主动队列管理）
-- Gil Tene — "How NOT to Measure Latency"（协调遗漏）
+### 4.4 Median Decisions, Slow Start, and Usage Constraints
+
+| Condition | Behavior |
+|---|---|
+| `p50 >= high` | Increments the high-latency counter and clears the low-latency counter; at `BackoffTicks`, sets the adjustment factor to `1 - DownStep` |
+| `p50 <= low` | Increments the low-latency counter and clears the high-latency counter; at `RecoverTicks`, checks usage and attempts growth |
+| `low < p50 < high` | Clears both counters and keeps the quota |
+
+After a corresponding action, that side's counter is reset. Counters apply to ticks that have samples; see §4.1 for ticks without samples. The default `BackoffTicks`/`RecoverTicks` are `1/1` for the baseline anchor and `2/2` for an effective SLO anchor; presets or explicit configuration can override them.
+
+When the growth conditions are met, usage is checked first. When usage is known and `Used × 2 < R`, the quota is kept, avoiding a sustained increase of the admission ceiling without traffic to validate it:
+
+- Outbound usage is the number of calls entering `Take()` during the tick divided by `Tick`, including calls still waiting for release.
+- Inbound usage is the peak number of in-flight requests during the tick; a new tick starts from the current in-flight count, and requests spanning ticks continue to count.
+- When no usage was observed it is treated as unknown and does not block growth, for example on paths that only call `Observe()`.
+
+When growth is allowed, the slow-start phase uses `SlowStartGain`, multiplying by 2 by default; afterwards `1 + UpStep` is used, multiplying by 1.05 by default. Slow start ends on the first median backoff, tail backoff, or outage backoff, or once the maximum quota is reached; the recovery phase does not re-enable slow start. `SlowStartGain = 1` disables multiplicative growth.
+
+Both normal growth and backoff are computed as proportions of the current quota, not as fixed additive amounts. The default backoff factor is `1 - DownStep = 0.70`; there is no separate symmetric per-tick change limit.
+
+### 4.5 Tail Latency Protection
+
+Configuring `SLOTarget` enables tail-latency protection with the threshold `T = SLOTarget × TailFactor`, `TailFactor = 1` by default. It does not change the median window, only the tail decision threshold.
+
+When the resolved `TailTolerance = 0`, quantile mode is used: `p99 > T` triggers backoff. When `TailTolerance > 0`, ratio mode is used; let `tol` denote the tolerated ratio:
+
+```text
+alpha = 1 - 2^(-1/2)                      // half-life of two ticks
+ratio = above / n
+smoothed ← smoothed + alpha × (ratio - smoothed)
+sigma = sqrt(tol × (1 - tol) / n) × sqrt(alpha / (2 - alpha))
+threshold = tol + 3 × sigma
+
+Trigger condition: smoothed > threshold and ratio > tol
+```
+
+The statistical margin is estimated from the current sample count: with few samples the threshold is wider, reducing backoffs caused by sampling noise; the current-ratio condition prevents continued backoff merely because the smoothed value is still high. This approximate statistical criterion is not a long-window SLO attainment guarantee.
+
+Tail-latency protection and outage backoff do not wait for `BackoffTicks`. When triggered, they cap the adjustment factor at no more than `1 - DownStep`; multiple backoff conditions do not multiply.
+
+## 5. Failure and Recovery
+
+### 5.1 Failure Detection and Synthetic Samples
+
+`Unavailable()` increments the unreachable count and immediately sets probe state, without directly modifying the quota. At the start of a control tick, if unreachable records exist and their count is at least twice the then-current `hist.total`, the controller attempts to construct a synthetic sample and marks the tick as an outage tick. Concurrent reads of the two counters are an approximation at tick granularity, not a strictly synchronized business error-rate statistic.
+
+The synthetic latency is constructed as follows:
+
+- With SLO: `1.5 × max(SLOTarget, B)`.
+- Without SLO and with an initialized baseline: `1.5 × B × (1 + TargetInflation)`.
+- Without SLO and without an initialized baseline: no sample can be constructed, so no outage backoff is performed.
+
+At most one synthetic sample is added per outage tick, and the backoff factor is applied directly. The sample keeps the control input fed during an outage; it does not represent a real latency, nor is it used to scale the tail over-threshold ratio by the number of unreachable calls. With only a few unreachable calls, no synthetic sample is added and no forced outage backoff occurs.
+
+### 5.2 Floor Switching and Quota Clamping
+
+Normal state uses `FloorRate` and probe state uses `ProbeRate`; concurrency mode corresponds to `FloorLimit` and `ProbeLimit`. The final control update is:
+
+```text
+floor = probe ? ProbeRate : FloorRate
+R ← clamp(R × factor, floor, MaxRate)
+```
+
+A normal `Observe()` or a `Reached` outcome clears probe state, and subsequent control updates return to the normal floor constraint. `Aborted` and `ObserveTruncated()` do not clear probe state. A floor switch does not immediately modify the actuator; failure detection and the current probe state independently decide whether to back off and which lower bound to use.
+
+The default probe quota is at least 1, so recovery observation opportunities remain. The normal floor is the caller's judgment of safe capacity; when timeouts persist without being classified as unreachable, the controller remains bounded by the normal floor, and if real capacity is below that floor the limiter cannot back off further.
+
+## 6. Configuration and Runtime Mechanics
+
+### 6.1 Configuration Resolution
+
+Construction first calls `applyPreset()`, then `withDefaults()` fills in defaults and corrects some conflicts. The table below gives the policy for fields a preset does not override:
+
+| Preset | Anchor | BackoffTicks / RecoverTicks | TargetInflation | TailTolerance |
+|---|---|---|---|---|
+| `PresetNone`, no SLO | Baseline | 1 / 1 | 1.0 | 0, tail protection off |
+| `PresetNone`, with SLO | SLO | 2 / 2 | 1.0 | 0.05 |
+| `PresetBalanced` | Baseline | 1 / 1 | 1.0 | 0, quantile mode |
+| `PresetLatencyFirst` | SLO | 2 / 2 | 1.0 | 0, quantile mode |
+| `PresetThroughputFirst` | Baseline | 2 / 1 | 2.5 | 0, quantile mode |
+
+Tail protection always requires `SLOTarget > 0`. A preset fills values according to each field's unset test; positive explicitly tuned values and an explicit anchor take precedence, and a zero value usually means the default. For example, with `PresetNone` plus an SLO, `TailTolerance = 0` resolves to 0.05 and cannot be used to force quantile mode.
+
+For bounds, `MinRate` defaults to 1; an unspecified `FloorRate` or `ProbeRate` inherits `MinRate`. `InitialRate` defaults to the integer `MaxRate / 8`, then clamped between the normal floor and the maximum. `Tick = 1s` by default; other control parameters are described in §4. Concurrency configuration follows the same resolution rules.
+
+`New()` does not call `Validate()` automatically and does not return configuration errors; a caller that wants strict configuration checking must do it explicitly before construction. Some conflicts change the effective ceiling, for example `MaxRate = 100, FloorRate = 200` raises the effective `MaxRate` to 200. Inspect the `Resolved` value returned by `Config()` for the final configuration, window, and tail policy.
+
+### 6.2 Actuators and Concurrency Boundaries
+
+The leaky bucket computes the release interval as `1s / rate`. The first call is released immediately; subsequent releases are scheduled from the previous release instant, realigned to the current time after idleness, and no burst allowance accumulates. A rate update only changes the interval read afterwards; it does not reset existing timing state or interrupt a wait in progress.
+
+The semaphore acquires a slot with an atomic compare-and-swap and releases it with an atomic decrement. Lowering the concurrency ceiling does not cancel already admitted requests; the current in-flight count may temporarily exceed the new ceiling, and subsequent admission resumes once in-flight requests have naturally drained.
+
+The controller guards state updates and statistics reads with a mutex; the histogram, usage counters, and semaphore use atomic operations. The leaky bucket performs its wait while holding the mutex, and `Observe()` also takes the controller lock to clear probe state, so the overall request path is not lock-free. The zero-allocation property is verified by the corresponding tests and is not the same as being lock-free or non-blocking.
+
+The maximum quota constraint lives in the controller. `bucket.setRate()` and `semaphore.setLimit()` only guard the minimum of 1 and do not independently store or validate the configured ceiling. The current implementation therefore has no second maximum-value guard at the actuator layer; the constraint applies to the resolved configuration and should not be described as preserving the caller's original ceiling under all configurations.
+
+### 6.3 Lifecycle and Observability
+
+`Start()` and `Stop()` use `sync.Once` so that repeated calls neither start the loop twice nor close the stop channel twice. `Stop()` waits for the background loop to exit; a stopped instance cannot be restarted, and stopping does not cancel already admitted business requests or interrupt a `Take()` wait. Lifecycle calls should be managed centrally by the owning service.
+
+`Clock` controls core call timing and the leaky-bucket wait; the background ticker still uses real time. Virtual-clock tests drive evolution by executing the control step directly rather than replacing the background ticker.
+
+The key observability fields are:
+
+| Interface or field | Meaning |
+|---|---|
+| `Rate()` / `Limit()`, `InFlight()` | Current target rate or actuator concurrency ceiling, and the actual in-flight count; `Rate()` may be fractional |
+| `Stats.Samples`, `P50`, `P99` | Sample count and approximate quantiles read by the most recent control step; outage ticks may include a synthetic sample |
+| `Stats.Baseline`, `Fast` | Smoothed baseline and the median of the most recent non-empty tick |
+| `Stats.TailRatio`, `TailThreshold` | Smoothed over-threshold ratio and trigger threshold in ratio mode |
+| `Stats.ColdStart`, `Used` | Slow-start state and the usage of the most recent tick |
+| `Config()` | Resolved bounds, control parameters, and effective policy |
+
+On empty ticks `Samples/P50/P99` are zero, but the baseline and part of the control state are retained. Persistent absence of samples means there is no basis for adjustment; an unchanged quota alone does not prove the system is stable. The HTTP `StatsHandler` provides a JSON view of part of this state and should be mounted outside the admission middleware so it remains reachable under overload.
+
+## 7. Design Trade-offs and Known Limitations
+
+| Design decision | Technical rationale | Cost or boundary |
+|---|---|---|
+| Shared controller, separate actuators | Both modes can turn latency feedback into a scalar quota update | Protected targets, quota units, and usage semantics differ, so configuration cannot be copied directly between them |
+| Non-blocking inbound admission | Keeps overloaded requests from waiting inside the limiter and holding resources | Callers must handle rejections; HTTP returns 429 by default |
+| Asymmetric baseline update with rise clamping | Limits how sustained congestion raises the relative window | A genuine long-term latency shift takes longer to absorb |
+| Multiplicative slow start, small proportional recovery growth | Shortens initial exploration while reducing overshoot again during recovery | Recovery after a deep backoff may be slow |
+| Ratio-based tail protection | Tolerates a small, fixed set of slow requests and reduces the effect of single-tick quantile noise | Too many fast samples dilute the over-threshold ratio; the statistical margin is wide at low sample counts |
+| Outcome classification at the integration boundary | Only the business and protocol layers can judge whether a sample reflects processing capacity | Default policies cannot cover every caching, degradation, and retry semantic |
+
+Latency alone cannot distinguish queuing, network changes, fixed slow operations, and local overhead. Instance partitioning and sample classification directly affect control quality; tail tolerance is also no substitute for filtering out invalid fast samples.
+
+Control runs per tick, so sampling and feedback lag exist. Changing `Tick` alters both the number of adjustments per unit time and the per-tick baseline rise limit, so it should be validated together with the growth, backoff, and half-life parameters. `Take()` currently accepts no context, so a wait cannot end early when the request is canceled; streaming calls, global quotas, and full-stop probing require separate handling.
+
+## 8. Verification and Maintenance Entry Points
+
+| What is verified | Code entry point |
+|---|---|
+| Release pacing, rate changes, growth, and backoff | [limiter_test.go](../limiter_test.go), [concurrency_test.go](../concurrency_test.go) |
+| Anchors, hysteresis, slow start, and configuration resolution | [anchor_test.go](../anchor_test.go), [slowstart_test.go](../slowstart_test.go), [config_test.go](../config_test.go) |
+| Outages, cancellation, floor switching, and recovery | [outage_test.go](../outage_test.go), [refused_diag_test.go](../refused_diag_test.go), [floor_probe_test.go](../floor_probe_test.go), [concurrency_probe_test.go](../concurrency_probe_test.go) |
+| Bound constraints and statistical precision under random input | [properties_test.go](../properties_test.go) |
+| Protocol classification, admission rejection, and resource release | [httpclient/httpclient_test.go](../httpclient/httpclient_test.go), [httpserver/httpserver_test.go](../httpserver/httpserver_test.go) |
+| Lifecycle and statistics output | [observability_test.go](../observability_test.go) |
+| Hot-path allocations and benchmarks | [bench_test.go](../bench_test.go), plus benchmarks in both HTTP packages |
+| Capacity changes, sample contamination, and mixed traffic | [sim/](../sim/) |
+
+The core tests use a custom fake clock and drive the control step directly; `sim/` drives the controller through the internal [simhook](../internal/simhook/simhook.go) and injects modeled usage, so no simulated time needs to actually elapse. The main module depends only on the Go standard library.
+
+Run the following from the repository root:
+
+```bash
+go test ./...                    # Full test suite for the main module
+go test -short ./...             # Skips some long-running simulations
+go test -race ./...              # Race detection; long simulations take longer
+go test -run '^TestAdvantage' -v ./sim
+```
+
+[compare/](../compare/) is a separate Go module containing real-clock comparison experiments and diagnostic tests, and is not covered by `go test ./...` at the root. Historical results are in [RESULTS.md](../compare/RESULTS.md) and [ADVANTAGE.md](../compare/ADVANTAGE.md); some of those figures come from older controller versions and must not be read as performance guarantees for the current implementation. When evaluating the control strategy, record the version, model, configuration, and measurement methodology, and watch goodput within SLO, overload duration, and recovery time together.

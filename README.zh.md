@@ -149,7 +149,7 @@ Preset: agilelimiter.PresetLatencyFirst
 它会维护一个缓慢变化的正常延迟基线，所以短时抖动不会立刻改写目标。  
 下游不可达时，速率可以降到 `ProbeRate`；收到正常响应后回到正常地板。
 
-这里不需要你调公式。完整控制律和实测权衡在 [docs/design.md](docs/design.md)。
+这里不需要你调公式。完整控制律和实测权衡在 [docs/design.zh.md](docs/design.zh.md)。
 
 ## 可观测性
 
@@ -188,7 +188,7 @@ go test -race ./...
 
 更多：
 
-- [docs/design.md](docs/design.md) — 控制律与设计权衡
+- [docs/design.zh.md](docs/design.zh.md) — 控制律与设计权衡
 - [docs/integrations.md](docs/integrations.md) — HTTP/gRPC 集成
 - [httpclient](httpclient/) / [httpserver](httpserver/) — 开箱适配器
 - [sim/](sim/) — 虚拟时钟仿真与对比

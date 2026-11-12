@@ -1,14 +1,11 @@
-// Package torture holds adversarial, long-tail stress tests for the inbound side
-// of the library.
+// Package torture holds adversarial, long-tail stress tests for the library's
+// inbound and outbound limiters.
 //
-// These are end-to-end tests over real HTTP: a real net/http server behind the
-// real httpserver middleware, driven by real HTTP clients. The handler sleeps to
-// imitate I/O, so the durations the controller sees come from the same code path
-// an application would use — not from a simulation of one.
+// The tests use real HTTP through the library's httpserver and httpclient
+// adapters. The server handlers sleep to imitate I/O.
 //
-// The point of the package is a question the unit tests cannot ask: when a small
-// fraction of requests is dramatically slower than the rest, does the limiter
-// throttle the healthy majority?
+// The tests check that a small slow cohort leaves healthy traffic alone and
+// that a widespread slowdown makes the outbound limiter back off.
 package torture
 
 import (
@@ -25,6 +22,7 @@ import (
 	"time"
 
 	"github.com/Yiming1997/agilelimiter"
+	"github.com/Yiming1997/agilelimiter/httpclient"
 	"github.com/Yiming1997/agilelimiter/httpserver"
 )
 
@@ -44,10 +42,14 @@ type workload struct {
 
 // pick returns the I/O duration for the seq'th request.
 func (w workload) pick(seq int) time.Duration {
-	if w.tailEvery > 0 && seq%w.tailEvery == 0 {
+	if w.isTail(seq) {
 		return w.tail
 	}
 	return w.base
+}
+
+func (w workload) isTail(seq int) bool {
+	return w.tailEvery > 0 && seq%w.tailEvery == 0
 }
 
 func (w workload) label() string {
@@ -83,9 +85,8 @@ func newService(
 
 	handler := http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
 		n := int(seq.Add(1))
-		isTail := w.tailEvery > 0 && n%w.tailEvery == 0
 		// Tell the client what this request was. The client cannot infer it.
-		if isTail {
+		if w.isTail(n) {
 			rw.Header().Set(tailHeader, "1")
 		}
 		time.Sleep(w.pick(n))
@@ -476,5 +477,209 @@ func TestLongTailDoesNotThrottleTheMajority(t *testing.T) {
 	if tailRes.ok200 < 200 {
 		t.Fatalf("only %d successful responses; the harness is broken, not the limiter",
 			tailRes.ok200)
+	}
+}
+
+func newOutboundService(t *testing.T, base, tail, slo time.Duration, initialRate int) (string, *http.Client, *agilelimiter.Limiter) {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		delay := base
+		if r.URL.Path == "/slow" {
+			delay = tail
+		}
+		time.Sleep(delay)
+		rw.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+
+	lim := agilelimiter.New(agilelimiter.Config{
+		FloorRate:     50,
+		ProbeRate:     10,
+		InitialRate:   initialRate,
+		MaxRate:       2 * initialRate,
+		SLOTarget:     slo,
+		TailTolerance: 0.05,
+		Tick:          250 * time.Millisecond,
+	})
+	lim.Start()
+	t.Cleanup(lim.Stop)
+
+	transport := &http.Transport{MaxIdleConnsPerHost: 64}
+	t.Cleanup(transport.CloseIdleConnections)
+	client := &http.Client{Transport: httpclient.Wrap(transport, lim), Timeout: 2 * time.Second}
+	return srv.URL, client, lim
+}
+
+func getDownstream(client *http.Client, url string) error {
+	resp, err := client.Get(url)
+	if err != nil {
+		return err
+	}
+	err = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("unexpected downstream status %s", resp.Status)
+	}
+	return err
+}
+
+func TestOutboundLongTailDoesNotThrottleTheMajority(t *testing.T) {
+	if testing.Short() {
+		t.Skip("end-to-end load test")
+	}
+
+	const (
+		offeredRate = 200
+		interval    = time.Second / offeredRate
+		requests    = 4 * offeredRate
+		slo         = 150 * time.Millisecond
+		base        = 50 * time.Millisecond
+		tail        = 250 * time.Millisecond
+		tailEvery   = 20
+	)
+
+	for _, tc := range []struct {
+		name     string
+		workload workload
+		wantSlow int
+	}{
+		{name: "clean", workload: workload{base: base}},
+		{name: "tailed", workload: workload{base: base, tail: tail, tailEvery: tailEvery}, wantSlow: requests / tailEvery},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := tc.workload
+			baseURL, client, lim := newOutboundService(t, w.base, w.tail, slo, offeredRate)
+
+			// Schedule a fixed number of calls independently of completions. Time
+			// spent waiting for the outbound limiter counts toward the caller's SLO.
+			results := make([]struct {
+				isTail  bool
+				latency time.Duration
+				err     error
+			}, requests)
+			var wg sync.WaitGroup
+			minRate := lim.Rate()
+			start := time.Now()
+			for i := range results {
+				scheduled := start.Add(time.Duration(i) * interval)
+				time.Sleep(time.Until(scheduled))
+				minRate = min(minRate, lim.Rate())
+
+				result := &results[i]
+				result.isTail = w.isTail(i + 1)
+				url := baseURL
+				if result.isTail {
+					url += "/slow"
+				}
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					result.err = getDownstream(client, url)
+					result.latency = time.Since(scheduled)
+				}()
+			}
+			wg.Wait()
+
+			var healthyWithinSLO, slowAboveSLO, failed int
+			var firstErr error
+			for _, result := range results {
+				switch {
+				case result.err != nil:
+					failed++
+					if firstErr == nil {
+						firstErr = result.err
+					}
+				case result.isTail && result.latency > slo:
+					slowAboveSLO++
+				case !result.isTail && result.latency <= slo:
+					healthyWithinSLO++
+				}
+			}
+
+			pct := 100 * float64(healthyWithinSLO) / float64(requests-tc.wantSlow)
+			t.Logf("%s | offered=%d req/s | healthy within %v: %.1f%% | slow above SLO: %d/%d | minimum rate: %.0f req/s",
+				w.label(), offeredRate, slo, pct, slowAboveSLO, tc.wantSlow, minRate)
+			if failed > 0 {
+				t.Errorf("%d downstream calls failed; first error: %v", failed, firstErr)
+			}
+			if slowAboveSLO != tc.wantSlow {
+				t.Errorf("%d slow calls exceeded the SLO, want %d", slowAboveSLO, tc.wantSlow)
+			}
+			if pct < 95 {
+				t.Errorf("%.1f%% of healthy calls met the SLO, want at least 95%%", pct)
+			}
+			if minRate < 0.8*offeredRate {
+				t.Errorf("limiter rate fell to %.0f req/s, want at least %.0f req/s while offering load", minRate, 0.8*offeredRate)
+			}
+		})
+	}
+}
+
+func TestOutboundBacksOffWhenMostRequestsSlowDown(t *testing.T) {
+	if testing.Short() {
+		t.Skip("end-to-end load test")
+	}
+
+	const (
+		initialRate = 200
+		workers     = 24
+		slo         = 150 * time.Millisecond
+		maxSlowRate = 0.75 * initialRate
+	)
+	baseURL, client, lim := newOutboundService(t, 50*time.Millisecond, 250*time.Millisecond, slo, initialRate)
+
+	// Use the same limiter in both phases. Bound the number of callers so the
+	// queue can drain even after the limiter backs off.
+	runPhase := func(dur time.Duration, mostlySlow bool) (rate float64, total, slowAboveSLO int64) {
+		var wg sync.WaitGroup
+		var calls, slow atomic.Int64
+		var firstErr error
+		var errOnce sync.Once
+		deadline := time.Now().Add(dur)
+		for i := 0; i < workers; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for time.Now().Before(deadline) {
+					seq := calls.Add(1)
+					isSlow := mostlySlow && seq%5 != 0
+					url := baseURL
+					if isSlow {
+						url += "/slow"
+					}
+					started := time.Now()
+					if err := getDownstream(client, url); err != nil {
+						errOnce.Do(func() { firstErr = err })
+						return
+					}
+					if isSlow && time.Since(started) > slo {
+						slow.Add(1)
+					}
+				}
+			}()
+		}
+		time.Sleep(time.Until(deadline))
+		rate = lim.Rate() // Sample before waiting for the outstanding calls.
+		wg.Wait()
+		if firstErr != nil {
+			t.Fatalf("downstream call failed: %v", firstErr)
+		}
+		return rate, calls.Load(), slow.Load()
+	}
+
+	warmRate, warmCalls, _ := runPhase(1500*time.Millisecond, false)
+	t.Logf("healthy phase: %d calls, limiter rate %.0f req/s", warmCalls, warmRate)
+	if warmRate < initialRate {
+		t.Fatalf("healthy phase ended at %.0f req/s, want at least %d req/s", warmRate, initialRate)
+	}
+
+	slowRate, slowCalls, slowAboveSLO := runPhase(2*time.Second, true)
+	t.Logf("slow phase: %d/%d calls to the slow endpoint exceeded %v, limiter rate %.0f req/s",
+		slowAboveSLO, slowCalls, slo, slowRate)
+	if slowCalls < 40 || 4*slowAboveSLO < 3*slowCalls {
+		t.Errorf("%d/%d calls were slow, want at least 40 calls with at least 75%% slow", slowAboveSLO, slowCalls)
+	}
+	if slowRate > maxSlowRate {
+		t.Errorf("limiter rate went from %.0f to %.0f req/s, want at most %.0f req/s after the slowdown",
+			warmRate, slowRate, maxSlowRate)
 	}
 }

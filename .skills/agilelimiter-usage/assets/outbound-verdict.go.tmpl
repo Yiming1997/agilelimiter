@@ -1,0 +1,18 @@
+package limiterintegration
+
+import (
+	"net/http"
+	"time"
+
+	"github.com/Yiming1997/agilelimiter"
+	"github.com/Yiming1997/agilelimiter/httpclient"
+)
+
+// Pass httpclient.WithVerdict(skipQueueAcknowledgement) to the outbound wrapper
+// when HTTP 202 only acknowledges work queued for later processing.
+func skipQueueAcknowledgement(resp *http.Response, err error, d time.Duration) agilelimiter.Outcome {
+	if err == nil && resp != nil && resp.StatusCode == http.StatusAccepted {
+		return agilelimiter.Aborted
+	}
+	return httpclient.DefaultVerdict(resp, err, d)
+}

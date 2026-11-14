@@ -1,0 +1,27 @@
+package limiterintegration
+
+import (
+	"fmt"
+	"net/http"
+
+	"github.com/Yiming1997/agilelimiter"
+	"github.com/Yiming1997/agilelimiter/httpserver"
+)
+
+// Register the returned handler on the routes that share the protected resource.
+// Start and stop the returned limiter with the application lifecycle.
+func newInboundHTTP(
+	next http.Handler,
+	cfg agilelimiter.ConcurrencyConfig,
+	opts ...httpserver.Option,
+) (http.Handler, *agilelimiter.ConcurrencyLimiter, error) {
+	if err := cfg.Validate(); err != nil {
+		return nil, nil, fmt.Errorf("inbound limiter config: %w", err)
+	}
+
+	lim := agilelimiter.NewConcurrency(cfg)
+	if actual := lim.Config().MaxRate; actual != cfg.MaxLimit {
+		return nil, nil, fmt.Errorf("inbound max limit changed from %d to %d", cfg.MaxLimit, actual)
+	}
+	return httpserver.Wrap(next, lim, opts...), lim, nil
+}

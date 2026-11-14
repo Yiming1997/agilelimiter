@@ -1,0 +1,27 @@
+package limiterintegration
+
+import (
+	"time"
+
+	"github.com/Yiming1997/agilelimiter"
+)
+
+func callWithRateLimit(lim *agilelimiter.Limiter, call func() error) error {
+	lim.Take()
+	started := time.Now()
+	err := call()
+	lim.ObserveOutcome(time.Since(started), err)
+	return err
+}
+
+func handleWithConcurrencyLimit(lim *agilelimiter.ConcurrencyLimiter, handle func() error) error {
+	if !lim.TryTake() {
+		return agilelimiter.ErrOverloaded
+	}
+	defer lim.Release()
+
+	started := time.Now()
+	err := handle()
+	lim.ObserveOutcome(time.Since(started), err)
+	return err
+}

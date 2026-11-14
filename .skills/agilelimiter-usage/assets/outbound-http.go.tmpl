@@ -1,0 +1,27 @@
+package limiterintegration
+
+import (
+	"fmt"
+	"net/http"
+
+	"github.com/Yiming1997/agilelimiter"
+	"github.com/Yiming1997/agilelimiter/httpclient"
+)
+
+// Assign the returned transport to the client before it starts serving calls.
+// Start and stop the returned limiter with the application lifecycle.
+func newOutboundHTTP(
+	transport http.RoundTripper,
+	cfg agilelimiter.Config,
+	opts ...httpclient.Option,
+) (http.RoundTripper, *agilelimiter.Limiter, error) {
+	if err := cfg.Validate(); err != nil {
+		return nil, nil, fmt.Errorf("outbound limiter config: %w", err)
+	}
+
+	lim := agilelimiter.New(cfg)
+	if actual := lim.Config().MaxRate; actual != cfg.MaxRate {
+		return nil, nil, fmt.Errorf("outbound max rate changed from %d to %d", cfg.MaxRate, actual)
+	}
+	return httpclient.Wrap(transport, lim, opts...), lim, nil
+}

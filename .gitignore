@@ -6,3 +6,5 @@
 # temp-file rename-over fails and the temp file is left behind.
 *.go.[0-9]*
 *-go-tmp-*
+
+.idea

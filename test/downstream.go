@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"agilelimiter"
+	"github.com/Yiming1997/agilelimiter"
 )
 
 // response is one simulated round trip. Hit separates the two populations a

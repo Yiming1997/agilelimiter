@@ -4,8 +4,8 @@
 // compiles the local library, never a published copy.
 module agilelimiter/test
 
-go 1.23
+go 1.24.0
 
-require agilelimiter v0.0.0
+require github.com/Yiming1997/agilelimiter v0.0.0
 
-replace agilelimiter => ../
+replace github.com/Yiming1997/agilelimiter => ../

@@ -8,7 +8,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"agilelimiter"
+	"github.com/Yiming1997/agilelimiter"
 )
 
 // loadOptions is one driving run: Workers callers hammer the limiter for

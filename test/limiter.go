@@ -6,7 +6,7 @@ import (
 	"strings"
 	"time"
 
-	"agilelimiter"
+	"github.com/Yiming1997/agilelimiter"
 )
 
 // limiterParams is the parsed limiter configuration, kept in Store for readers

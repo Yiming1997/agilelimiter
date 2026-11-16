@@ -21,7 +21,7 @@ import (
 	"fmt"
 	"time"
 
-	"agilelimiter"
+	"github.com/Yiming1997/agilelimiter"
 )
 
 type hcachePlugin struct{}

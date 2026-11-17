@@ -7,9 +7,9 @@ import (
 
 	"github.com/Yiming1997/agilelimiter"
 	"github.com/Yiming1997/agilelimiter/httpserver"
-	iplimiter "github.com/Yiming1997/agilelimiter/inbound_limiter"
-	httplimit "github.com/Yiming1997/agilelimiter/inbound_limiter/httplimiter"
-	"github.com/Yiming1997/agilelimiter/inbound_limiter/memorystore"
+	iplimiter "github.com/Yiming1997/agilelimiter/iplimiter"
+	httplimit "github.com/Yiming1997/agilelimiter/iplimiter/httplimit"
+	"github.com/Yiming1997/agilelimiter/iplimiter/memorystore"
 )
 
 // Handler applies per-key quotas before the existing adaptive HTTP middleware.
@@ -44,6 +44,7 @@ func NewHandler(next http.Handler, adaptive *agilelimiter.ConcurrencyLimiter, cf
 		Tokens:        cfg.Tokens,
 		Interval:      cfg.Interval,
 		MaxKeys:       cfg.MaxKeys,
+		MaxKeyLen:     cfg.MaxKeyLen,
 		SweepInterval: cfg.SweepInterval,
 		SweepMinTTL:   cfg.SweepMinTTL,
 	})

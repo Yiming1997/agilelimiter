@@ -18,16 +18,29 @@ import (
 	"sync/atomic"
 	"time"
 
-	limiter "github.com/Yiming1997/agilelimiter/inbound_limiter"
+	iplimiter "github.com/Yiming1997/agilelimiter/iplimiter"
 )
 
 const shardCount = 64
 
+// DefaultMaxKeyLen is the default key length bound, in bytes.
+//
+// It is generous on purpose: the longest identifier this store is likely to
+// see is an IPv6 address in its longest form (39 bytes), and a hashed
+// identifier is shorter still. The bound exists so that a caller feeding
+// unbounded user input into a key cannot turn one request into 64 KiB of
+// retained memory.
+const DefaultMaxKeyLen = 256
+
 // Config uses one token per second when Tokens or Interval is not positive.
 type Config struct {
-	Tokens        uint64
-	Interval      time.Duration
-	MaxKeys       int64
+	Tokens   uint64
+	Interval time.Duration
+	MaxKeys  int64
+	// MaxKeyLen bounds the length of a key, in bytes. A longer key is
+	// rejected with iplimiter.ErrKeyTooLong instead of being stored.
+	// Zero takes DefaultMaxKeyLen.
+	MaxKeyLen     int
 	SweepInterval time.Duration // Default: six hours.
 	SweepMinTTL   time.Duration // Minimum idle retention; default: twelve hours.
 	DisablePurge  bool          // Only suitable for a bounded set of keys.
@@ -37,6 +50,7 @@ type store struct {
 	tokens        uint64
 	interval      time.Duration
 	maxKeys       int64
+	maxKeyLen     int
 	keyCount      atomic.Int64
 	sweepInterval time.Duration
 	sweepMinTTL   time.Duration
@@ -63,14 +77,15 @@ type window struct {
 	touched   time.Time
 }
 
-var _ limiter.Store = (*store)(nil)
+var _ iplimiter.Store = (*store)(nil)
 
 // New allocates a store. Close releases its keys and optional cleanup loop.
-func New(cfg *Config) limiter.Store {
+func New(cfg *Config) iplimiter.Store {
 	c := Config{
 		Tokens:        1,
 		Interval:      time.Second,
 		MaxKeys:       100000,
+		MaxKeyLen:     DefaultMaxKeyLen,
 		SweepInterval: 6 * time.Hour,
 		SweepMinTTL:   12 * time.Hour,
 	}
@@ -85,6 +100,9 @@ func New(cfg *Config) limiter.Store {
 		if cfg.MaxKeys > 0 {
 			c.MaxKeys = cfg.MaxKeys
 		}
+		if cfg.MaxKeyLen > 0 {
+			c.MaxKeyLen = cfg.MaxKeyLen
+		}
 		if cfg.SweepInterval > 0 {
 			c.SweepInterval = cfg.SweepInterval
 		}
@@ -98,6 +116,7 @@ func New(cfg *Config) limiter.Store {
 		tokens:        c.Tokens,
 		interval:      c.Interval,
 		maxKeys:       c.MaxKeys,
+		maxKeyLen:     c.MaxKeyLen,
 		sweepInterval: c.SweepInterval,
 		sweepMinTTL:   c.SweepMinTTL,
 		seed:          maphash.MakeSeed(),
@@ -120,6 +139,18 @@ func (s *store) shardFor(key string) *shard {
 	hash := maphash.String(s.seed, key)
 	index := hash % shardCount
 	return &s.shards[index]
+}
+
+// checkKey rejects a key that is longer than the store accepts.
+//
+// The check runs before the shard lock is taken: a key that will never be
+// stored has no reason to queue behind one that will. The length is counted
+// in bytes, not runes, because it is memory that is being bounded.
+func (s *store) checkKey(key string) error {
+	if len(key) > s.maxKeyLen {
+		return iplimiter.ErrKeyTooLong
+	}
+	return nil
 }
 
 // reserveKey reserves one slot before inserting a new key.
@@ -146,7 +177,7 @@ func (s *store) entry(
 
 	if b == nil {
 		if !s.reserveKey() {
-			return nil, limiter.ErrCapacity
+			return nil, iplimiter.ErrCapacity
 		}
 
 		if p.entries == nil {
@@ -182,12 +213,16 @@ func (s *store) Take(
 	_ context.Context,
 	key string,
 ) (uint64, uint64, uint64, bool, error) {
+	if err := s.checkKey(key); err != nil {
+		return 0, 0, 0, false, err
+	}
+
 	p := s.shardFor(key)
 	p.Lock()
 	defer p.Unlock()
 
 	if p.closed {
-		return 0, 0, 0, false, limiter.ErrStopped
+		return 0, 0, 0, false, iplimiter.ErrStopped
 	}
 
 	b, err := s.entry(p, key, time.Now())
@@ -206,11 +241,15 @@ func (s *store) Take(
 // Get Query the maximum and current remaining amount of a given key,
 // without deducting any amount or creating a new bucket.
 func (s *store) Get(_ context.Context, key string) (uint64, uint64, error) {
+	if err := s.checkKey(key); err != nil {
+		return 0, 0, err
+	}
+
 	p := s.shardFor(key)
 	p.Lock()
 	defer p.Unlock()
 	if p.closed {
-		return 0, 0, limiter.ErrStopped
+		return 0, 0, iplimiter.ErrStopped
 	}
 	b := p.entries[key]
 	if b == nil {
@@ -228,12 +267,16 @@ func (s *store) Set(
 	tokens uint64,
 	interval time.Duration,
 ) error {
+	if err := s.checkKey(key); err != nil {
+		return err
+	}
+
 	p := s.shardFor(key)
 	p.Lock()
 	defer p.Unlock()
 
 	if p.closed {
-		return limiter.ErrStopped
+		return iplimiter.ErrStopped
 	}
 
 	if interval <= 0 {
@@ -242,7 +285,7 @@ func (s *store) Set(
 
 	// Replacing an existing key does not consume another slot.
 	if p.entries[key] == nil && !s.reserveKey() {
-		return limiter.ErrCapacity
+		return iplimiter.ErrCapacity
 	}
 
 	if p.entries == nil {
@@ -267,12 +310,16 @@ func (s *store) Burst(
 	key string,
 	tokens uint64,
 ) error {
+	if err := s.checkKey(key); err != nil {
+		return err
+	}
+
 	p := s.shardFor(key)
 	p.Lock()
 	defer p.Unlock()
 
 	if p.closed {
-		return limiter.ErrStopped
+		return iplimiter.ErrStopped
 	}
 
 	b, err := s.entry(p, key, time.Now())

@@ -8,7 +8,7 @@ import (
 	"strconv"
 	"time"
 
-	limiter "github.com/Yiming1997/agilelimiter/inbound_limiter"
+	iplimiter "github.com/Yiming1997/agilelimiter/iplimiter"
 )
 
 const (
@@ -32,11 +32,11 @@ func IPKeyFunc() KeyFunc {
 }
 
 type Middleware struct {
-	store   limiter.Store
+	store   iplimiter.Store
 	keyFunc KeyFunc
 }
 
-func NewMiddleware(s limiter.Store, key KeyFunc) (*Middleware, error) {
+func NewMiddleware(s iplimiter.Store, key KeyFunc) (*Middleware, error) {
 	if s == nil {
 		return nil, errors.New("httplimit: store is required")
 	}
@@ -58,8 +58,18 @@ func (m *Middleware) Handle(next http.Handler) http.Handler {
 		limit, remaining, reset, allowed, err := m.store.Take(r.Context(), key)
 		if err != nil {
 			status := http.StatusInternalServerError
-			if errors.Is(err, limiter.ErrCapacity) {
+
+			switch {
+			case errors.Is(err, iplimiter.ErrCapacity):
+				// The store is full: the server cannot serve this key right
+				// now. That is the server's problem, not the caller's.
 				status = http.StatusServiceUnavailable
+			case errors.Is(err, iplimiter.ErrKeyTooLong):
+				// The key came from the KeyFunc, so an over-long one means
+				// the caller supplied an unbounded identifier. The client
+				// cannot fix it, but 400 says "do not send this again"
+				// where 500 says "try later" and would just repeat.
+				status = http.StatusBadRequest
 			}
 
 			http.Error(w, http.StatusText(status), status)

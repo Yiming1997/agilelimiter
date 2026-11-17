@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/Yiming1997/agilelimiter"
-	"github.com/Yiming1997/agilelimiter/inbound_limiter/inbound"
+	"github.com/Yiming1997/agilelimiter/iplimiter/inbound"
 )
 
 func main() {

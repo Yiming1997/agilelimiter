@@ -21,14 +21,8 @@ const (
 type KeyFunc func(*http.Request) (string, error)
 
 // IPKeyFunc Retrieve key by IP address
-func IPKeyFunc(headers ...string) KeyFunc {
+func IPKeyFunc() KeyFunc {
 	return func(r *http.Request) (string, error) {
-		for _, name := range headers {
-			if value := r.Header.Get(name);
-			value != "" {
-				return value, nil
-			}
-		}
 		peer, err := netip.ParseAddrPort(r.RemoteAddr)
 		if err != nil {
 			return "", err
@@ -63,7 +57,12 @@ func (m *Middleware) Handle(next http.Handler) http.Handler {
 		}
 		limit, remaining, reset, allowed, err := m.store.Take(r.Context(), key)
 		if err != nil {
-			http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+			status := http.StatusInternalServerError
+			if errors.Is(err, limiter.ErrCapacity) {
+				status = http.StatusServiceUnavailable
+			}
+
+			http.Error(w, http.StatusText(status), status)
 			return
 		}
 		deadline := time.Unix(0, int64(reset))

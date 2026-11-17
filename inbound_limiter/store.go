@@ -6,7 +6,10 @@ import (
 	"time"
 )
 
-var ErrStopped = errors.New("inbound limiter: store closed")
+var (
+	ErrStopped  = errors.New("inbound limiter: store closed")
+	ErrCapacity = errors.New("inbound limiter: key capacity reached")
+)
 
 // Store manages per-key quotas. Keys are stored as supplied; callers can derive
 // a stable HMAC when raw identifiers are unsuitable for the storage backend.

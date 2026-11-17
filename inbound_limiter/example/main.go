@@ -20,11 +20,12 @@ func main() {
 		fmt.Fprintln(w, "ok")
 	})
 	handler, err := inbound.NewHandler(work, adaptive, inbound.Config{
-		Enabled: true,
-		// Each IP address can make a maximum of 3 requests per window.
-		Tokens: 3,
-		// The window duration is 10 seconds.
-		Interval: 10 * time.Second,
+		Enabled:       true,
+		Tokens:        3,
+		Interval:      10 * time.Second,
+		MaxKeys:       100_000,
+		SweepInterval: 30 * time.Second,
+		SweepMinTTL:   2 * time.Minute,
 	})
 	if err != nil {
 		log.Print(err)

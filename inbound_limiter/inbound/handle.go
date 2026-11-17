@@ -40,7 +40,13 @@ func NewHandler(next http.Handler, adaptive *agilelimiter.ConcurrencyLimiter, cf
 	if key == nil {
 		key = httplimit.IPKeyFunc()
 	}
-	h.store = memorystore.New(&memorystore.Config{Tokens: cfg.Tokens, Interval: cfg.Interval})
+	h.store = memorystore.New(&memorystore.Config{
+		Tokens:        cfg.Tokens,
+		Interval:      cfg.Interval,
+		MaxKeys:       cfg.MaxKeys,
+		SweepInterval: cfg.SweepInterval,
+		SweepMinTTL:   cfg.SweepMinTTL,
+	})
 	ip, err := httplimit.NewMiddleware(h.store, key)
 	if err != nil {
 		_ = h.store.Close(context.Background())

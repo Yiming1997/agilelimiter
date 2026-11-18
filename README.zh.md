@@ -78,14 +78,42 @@ lim.ObserveOutcome(time.Since(start), err)
 
 ```go
 lim := agilelimiter.NewConcurrency(agilelimiter.ConcurrencyConfig{
-    MaxLimit:   500, // 硬上限
-    FloorLimit: 100, // 正常地板
-    ProbeLimit: 10,  // 故障地板
-    SLOTarget:  200 * time.Millisecond,
+    MinLimit:     2,                      // 显式给，别让它默认成 1
+    FloorLimit:   10,                     // 依赖抖动时的最小可用并发
+    ProbeLimit:   5,                      // 依赖挂了时的地板，别设 1
+    MaxLimit:     50,                     // ≈ 真实并发容量（连接池 / worker 数）
+    InitialLimit: 10,                     // 显式给，别让 MaxLimit/8 算
+    SLOTarget:    200 * time.Millisecond, // 必需：没有它就退化成纯吞吐保护
+    Classify:     myClassify,             // “没干活就失败”的错误 → Unreachable
 })
 lim.Start()
 defer lim.Stop()
+```
 
+每个字段都有理由（均为实测）：
+
+| 字段 | 为什么 |
+|---|---|
+| `SLOTarget` | **必需**。没有它就没有延迟锚点，控制器只拿中位数当信号，而基线会跟着涨 —— 限流器会退化成只保吞吐不保延迟：并发一路涨到真实容量的数倍，延迟跟着涨，吞吐一点不多。 |
+| `FloorLimit` / `ProbeLimit` | 省略时都继承 `MinLimit`（默认 1）。一次依赖故障就把并发压到 1，等于停服。 |
+| `MaxLimit` | 取**真实并发容量**（连接池 / worker 数），别当“留上限”用 —— 它是掉到底之后唯一的硬边界。 |
+| `InitialLimit` | 默认 `MaxLimit/8`。并发上限和容量之间没有线性关系：`MaxLimit=1000` 会让初始并发变成 125，可能是真实容量的十几倍。 |
+| `MinLimit` | 只是 `FloorLimit`/`ProbeLimit` 的兜底；两者都显式给时它不参与。 |
+| `Classify` | “没干活就失败”的请求（缓存 503、鉴权拒绝、熔断打开）耗时≈0。不标成 `Unreachable` 就会被读成“服务很快”，故障中反而放开并发。 |
+
+```go
+func myClassify(err error) agilelimiter.Outcome {
+    if errors.Is(err, ErrAuthRejected) || errors.Is(err, ErrCacheMiss) {
+        return agilelimiter.Unreachable // 没干活，耗时≈0，不是容量信号
+    }
+    return agilelimiter.Reached
+}
+```
+
+入站准入是**非阻塞**的：到上限时直接返回 `ErrOverloaded`，不会排队。  
+如果要跨多个调用持有配额，用 `TryTake` / `Release`。
+
+```go
 err := lim.Do(func() error {
     return handleRequest(w, r)
 })
@@ -93,9 +121,6 @@ if errors.Is(err, agilelimiter.ErrOverloaded) {
     http.Error(w, "overloaded", http.StatusTooManyRequests)
 }
 ```
-
-入站准入是**非阻塞**的：到上限时直接返回 `ErrOverloaded`，不会排队。  
-如果要跨多个调用持有配额，用 `TryTake` / `Release`。
 
 ### HTTP 中间件
 
@@ -105,13 +130,18 @@ import "github.com/Yiming1997/agilelimiter/httpserver"
 root := http.NewServeMux()
 root.Handle("/debug/limiter", httpserver.StatsHandler(lim))
 root.Handle("/", httpserver.Wrap(mux, lim,
-    httpserver.WithRetryAfter(time.Second)))
+    httpserver.WithRetryAfter(2*time.Second)))
 
 http.ListenAndServe(":8080", root)
 ```
 
 达到上限时 `httpserver.Wrap` 返回 `429`，并且只记录真正进入 handler 的请求。  
 `StatsHandler` 放在 wrapper 外面，服务饱和时也能读到状态。
+
+`WithRetryAfter` 值得加：没有 `Retry-After` 的 429 会让客户端立刻重试，把刚保护住的服务再打死一次。
+
+> 中间件对**每个**请求都占一个并发槽，包括几乎不花时间的缓存命中。  
+> 如果你的端点里“便宜请求”占绝大多数，把闸门只加在昂贵的那一段上（手动 `TryTake` / `Release`），端点吞吐能差出两个数量级。
 
 ## 配置
 
@@ -122,11 +152,12 @@ http.ListenAndServe(":8080", root)
 | `MaxRate` / `MaxLimit` | 硬上限，必填 |
 | `FloorRate` / `FloorLimit` | 正常运行地板，接近你信得过的静态速率 |
 | `ProbeRate` / `ProbeLimit` | 下游不可达时的地板，尽量低 |
-| `SLOTarget` | 可选延迟目标，启用尾延迟保护 |
+| `SLOTarget` | 延迟目标。**入站必填**，出站可选 |
 | `Classify` | 哪些错误算“没到达下游” |
+| `MinRate` / `MinLimit` | 兼容 fallback：`FloorRate` 或 `ProbeRate` 为 0 时继承它 |
+| `InitialRate` / `InitialLimit` | 冷启动起点，默认 `MaxRate/8` |
 
-`MinRate` / `MinLimit` 仍可作为兼容 fallback：  
-`FloorRate` 或 `ProbeRate` 为 0 时，会继承 `MinRate`。
+入站建议把 `FloorLimit`、`ProbeLimit`、`InitialLimit` 都显式给出来 —— 见上面的入站配置。
 
 Preset 是可选快捷方式：
 

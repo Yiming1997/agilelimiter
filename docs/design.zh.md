@@ -141,11 +141,11 @@ alpha(H) = 1 - 2^(-Tick / H)
 p50 < B：
     B ← B + alpha(SlowDownHalfLife) × (p50 - B)
 否则：
-    delta ← min(alpha(SlowHalfLife) × (p50 - B), B × MaxBaselineRise)
+    delta ← min(alpha(SlowHalfLife) × (p50 - B), B × MaxBaselineRise × (Tick / 1s))
     B ← B + delta
 ```
 
-默认 `SlowHalfLife = 45s`，`SlowDownHalfLife = SlowHalfLife / 9`，`MaxBaselineRise = 0.002`。基线较快跟随改善，缓慢吸收持续变慢，限制拥塞对基线的抬升。基线不是历史最小值，也不提供主动重置或周期性降载探测接口。
+默认 `SlowHalfLife = 45s`，`SlowDownHalfLife = SlowHalfLife / 9`，`MaxBaselineRise = 0.002`（每秒），约合每分钟 12%，与 Tick 无关。上升上限按**墙钟每秒**计量而不是每拍，因此无论控制循环跑得多快多慢，它与 EWMA 半衰期——两个描述同一物理量的旋钮——始终保持一致。基线较快跟随改善，缓慢吸收持续变慢，限制拥塞对基线的抬升。基线不是历史最小值，也不提供主动重置或周期性降载探测接口。
 
 ### 4.3 控制窗口与锚点
 
@@ -290,7 +290,7 @@ R ← clamp(R × factor, floor, MaxRate)
 
 延迟不能单独区分排队、网络变化、固定慢操作和本地开销。实例划分与样本分类直接影响控制效果；尾部容忍度也不能替代对无效快样本的过滤。
 
-控制按周期执行，存在采样和反馈滞后。修改 `Tick` 同时改变单位时间内的调节次数及按周期定义的基线上升限制，应结合增长、回退与半衰期参数验证。当前 `Take()` 不接收 context，等待不能因请求取消而提前结束；流式调用、全局配额及完全停止探测需要另行处理。
+控制按周期执行，存在采样和反馈滞后。修改 `Tick` 只改变单位时间内的调节次数（基线上升限制按秒计量，不再随 `Tick` 变化），但增长与回退因子仍是每满足条件的周期施加一次，因此仍应结合增长、回退与半衰期参数验证。当前 `Take()` 不接收 context，等待不能因请求取消而提前结束；流式调用、全局配额及完全停止探测需要另行处理。
 
 ## 8. 验证与维护入口
 

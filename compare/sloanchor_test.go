@@ -11,7 +11,7 @@
 // The bump is permanent after t=5s rather than transient, because a transient
 // one is the easy case: it is the sustained-but-benign slowdown that a relative
 // controller cannot recover from, since its baseline may only crawl up
-// MaxBaselineRise per tick and the ramp back is UpStep per tick.
+// MaxBaselineRise per second and the ramp back is UpStep per tick.
 //
 // The downstream uses sharpKnee, not the M/M/1 curve the other cases use. That
 // matters: under 1/(1-util) the controller's own queueing is already 5x the idle

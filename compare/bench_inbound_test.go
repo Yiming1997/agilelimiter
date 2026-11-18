@@ -55,9 +55,10 @@ type scenario struct {
 	degraded bool
 	slo      time.Duration
 
-	// maxBaselineRise overrides Config.MaxBaselineRise. Zero keeps the library
-	// default; a large value (1.0) disables the anti-drift cap, which is how the
-	// two fixes are isolated from each other in the A/B runs.
+	// maxBaselineRise overrides Config.MaxBaselineRise, which is a fraction per
+	// second. Zero keeps the library default; a very large value (10) disables
+	// the anti-drift cap, which is how the two fixes are isolated from each
+	// other in the A/B runs.
 	maxBaselineRise float64
 
 	// targetInflation overrides Config.TargetInflation. Zero keeps the library
@@ -367,15 +368,15 @@ func TestInboundMacroSlowSteady(t *testing.T) {
 
 // TestInboundMacroSlowNoDriftCap isolates the two fixes: the histogram
 // resolution fix is always active now, but the baseline drift cap is disabled
-// here (MaxBaselineRise=1.0), so the result shows what the histogram fix alone
-// buys.
+// here (MaxBaselineRise=10 per second), so the result shows what the histogram
+// fix alone buys.
 func TestInboundMacroSlowNoDriftCap(t *testing.T) {
 	if testing.Short() {
 		t.Skip("macro comparison is slow; skipped in -short")
 	}
 	reportScenario(t, slowSteady(func(s *scenario) {
 		s.name = "SLOW-STEADY, drift cap DISABLED (histogram fix only)"
-		s.maxBaselineRise = 1.0
+		s.maxBaselineRise = 10
 	}))
 }
 

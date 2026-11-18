@@ -177,12 +177,16 @@ type Config struct {
 	SlowDownHalfLife time.Duration // baseline follows improvements down
 
 	// MaxBaselineRise caps how fast the healthy baseline may creep upward, as a
-	// fraction per tick. It is the hard limit on "baseline pollution": without
+	// fraction per second. It is the hard limit on "baseline pollution": without
 	// it a sustained overload drags the baseline up toward the congested
 	// latency, the target window rises with it, and the controller freezes in
 	// the overloaded state — congestion widens its own tolerance. Keep it small
-	// (well under 1% per tick); a genuinely permanent slowdown is then absorbed
+	// (well under 1% per second); a genuinely permanent slowdown is then absorbed
 	// over minutes rather than seconds. Zero takes the default.
+	//
+	// The cap is per second of wall clock, not per tick, so it means the same
+	// thing at every Tick. The default is 0.2% per second — about 12% per
+	// minute, however often the controller runs.
 	MaxBaselineRise float64
 
 	// Tick is the control-loop period.
@@ -419,9 +423,9 @@ func withDefaults(c Config) Config {
 		c.SlowDownHalfLife = c.SlowHalfLife / 9
 	}
 	if c.MaxBaselineRise <= 0 {
-		// 0.2% per tick: at the default 1s tick, ~12% per minute. Slow enough
-		// that a transient overload cannot move the target, fast enough that a
-		// genuine permanent slowdown is absorbed within minutes.
+		// 0.2% per second: ~12% per minute, at any tick. Slow enough that a
+		// transient overload cannot move the target, fast enough that a genuine
+		// permanent slowdown is absorbed within minutes.
 		c.MaxBaselineRise = 0.002
 	}
 	if c.Tick <= 0 {

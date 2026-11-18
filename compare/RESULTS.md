@@ -40,7 +40,15 @@ Because this config sets an SLO, the controller uses the SLO anchor, where the
 window is a constant `0.8 × SLOTarget` and the latency baseline does not enter
 the decision. The baseline rise cap therefore does not affect this comparison;
 it matters for the baseline anchor, which is what `compare/sloanchor_test.go`
-and `compare/pollution_test.go` exercise.
+and `compare/matrix_test.go` exercise.
+
+One more caveat on reading any of this as a regression signal: the harness is a
+real-time simulation with no seed, and some of its outcomes are bimodal rather
+than merely noisy. In the matrix harness the baseline-anchored arm once collapsed
+to its floor (72 goodput/s at rate 5) where the same scenario in a fresh process
+on the same commit found the operating point (132 goodput/s at rate 120). Every
+other scenario and arm matched. `compare/` needs a reproducibility pass of its
+own before a single run of it can be used to judge a change.
 
 ## Case 1 — steady but UNKNOWN capacity: 150 req/s
 

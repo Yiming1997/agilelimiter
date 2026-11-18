@@ -141,11 +141,11 @@ alpha(H) = 1 - 2^(-Tick / H)
 p50 < B:
     B ← B + alpha(SlowDownHalfLife) × (p50 - B)
 otherwise:
-    delta ← min(alpha(SlowHalfLife) × (p50 - B), B × MaxBaselineRise)
+    delta ← min(alpha(SlowHalfLife) × (p50 - B), B × MaxBaselineRise × (Tick / 1s))
     B ← B + delta
 ```
 
-By default `SlowHalfLife = 45s`, `SlowDownHalfLife = SlowHalfLife / 9`, and `MaxBaselineRise = 0.002`. The baseline follows improvements quickly, absorbs persistent slowdowns slowly, and limits how much congestion can raise it. The baseline is not a historical minimum, and no interface is provided for actively resetting it or for periodic probe-based shedding.
+By default `SlowHalfLife = 45s`, `SlowDownHalfLife = SlowHalfLife / 9`, and `MaxBaselineRise = 0.002` per second — about 12% per minute, at any tick. The rise cap is a rate per second of wall clock rather than per tick, so it keeps agreeing with the EWMA half-life — two knobs that describe the same physical quantity — however often the control loop runs. The baseline follows improvements quickly, absorbs persistent slowdowns slowly, and limits how much congestion can raise it. The baseline is not a historical minimum, and no interface is provided for actively resetting it or for periodic probe-based shedding.
 
 ### 4.3 Control Window and Anchors
 
@@ -290,7 +290,7 @@ On empty ticks `Samples/P50/P99` are zero, but the baseline and part of the cont
 
 Latency alone cannot distinguish queuing, network changes, fixed slow operations, and local overhead. Instance partitioning and sample classification directly affect control quality; tail tolerance is also no substitute for filtering out invalid fast samples.
 
-Control runs per tick, so sampling and feedback lag exist. Changing `Tick` alters both the number of adjustments per unit time and the per-tick baseline rise limit, so it should be validated together with the growth, backoff, and half-life parameters. `Take()` currently accepts no context, so a wait cannot end early when the request is canceled; streaming calls, global quotas, and full-stop probing require separate handling.
+Control runs per tick, so sampling and feedback lag exist. Changing `Tick` alters the number of adjustments per unit time — the baseline rise limit is a rate per second and no longer depends on it — but the growth and backoff factors are applied once per eligible tick, so it should still be validated together with the growth, backoff, and half-life parameters. `Take()` currently accepts no context, so a wait cannot end early when the request is canceled; streaming calls, global quotas, and full-stop probing require separate handling.
 
 ## 8. Verification and Maintenance Entry Points
 

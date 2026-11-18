@@ -56,7 +56,7 @@ type ConcurrencyConfig struct {
 	SlowDownHalfLife time.Duration // baseline follows improvements down
 
 	// MaxBaselineRise caps how fast the healthy baseline may creep upward, as a
-	// fraction per tick. Zero takes the default. See Config.MaxBaselineRise.
+	// fraction per second. Zero takes the default. See Config.MaxBaselineRise.
 	MaxBaselineRise float64
 
 	// Tick is the control-loop period.

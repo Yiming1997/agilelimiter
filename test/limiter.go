@@ -87,7 +87,7 @@ func (limiterPlugin) Options() []Option {
 		{Name: "tick", Default: "250ms", Help: "control-loop period"},
 		{Name: "slow-hl", Default: "0", Help: "SlowHalfLife; 0 keeps the library default"},
 		{Name: "slow-down-hl", Default: "0", Help: "SlowDownHalfLife; 0 keeps the library default"},
-		{Name: "max-baseline-rise", Default: "0", Help: "MaxBaselineRise; 0 keeps the library default"},
+		{Name: "max-baseline-rise", Default: "0", Help: "MaxBaselineRise, a fraction per second; 0 keeps the library default"},
 		{Name: "target-inflation", Default: "0", Help: "TargetInflation; 0 keeps the library default"},
 		{Name: "up-step", Default: "0", Help: "additive increase per tick; 0 keeps the default"},
 		{Name: "down-step", Default: "0", Help: "max fractional decrease per tick; 0 keeps the default"},

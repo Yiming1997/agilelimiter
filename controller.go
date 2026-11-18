@@ -91,6 +91,15 @@ type controller struct {
 	lastP50, lastP99 time.Duration
 	lastSamples      uint64
 
+	// riseScale is the tick length in seconds. The baseline rise cap is a rate
+	// per second of wall clock, so a shorter tick takes a proportionally
+	// smaller step instead of a proportionally bigger budget: changing Tick
+	// changes how often the controller decides, not how fast the baseline may
+	// move. Without it the cap and the EWMA half-life — two knobs that
+	// describe the same physical quantity — disagreed whenever the tick was
+	// not one second.
+	riseScale float64
+
 	slowUpAlpha   float64
 	slowDownAlpha float64
 }
@@ -102,6 +111,7 @@ func newController(cfg Config, hist *histogram, setRate func(rate int)) *control
 		setRate:       setRate,
 		rate:          float64(cfg.InitialRate),
 		coldStart:     true,
+		riseScale:     float64(cfg.Tick) / float64(time.Second),
 		slowUpAlpha:   ewmaAlpha(cfg.SlowHalfLife, cfg.Tick),
 		slowDownAlpha: ewmaAlpha(cfg.SlowDownHalfLife, cfg.Tick),
 		// Two ticks: short enough to react to a blowout, long enough that one
@@ -177,7 +187,9 @@ func (c *controller) step() {
 		c.slow += c.slowDownAlpha * (v - c.slow)
 	} else {
 		delta := c.slowUpAlpha * (v - c.slow)
-		if maxRise := c.slow * c.cfg.MaxBaselineRise; delta > maxRise {
+		// The cap is a fraction per second of wall clock, scaled by the tick
+		// length: a faster loop takes smaller steps, not a bigger budget.
+		if maxRise := c.slow * c.cfg.MaxBaselineRise * c.riseScale; delta > maxRise {
 			delta = maxRise
 		}
 		c.slow += delta

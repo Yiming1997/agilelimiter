@@ -29,9 +29,26 @@ SLO), % of requests within SLO, mean and p99 latency, and the final rate.
 
 The agile config used throughout: `InitialRate=40`, `MaxRate=500`,
 `SLOTarget=100ms` (== the SLO), `SlowHalfLife=45s`, `TargetInflation=2.5`,
-`Tick=250ms`. These numbers were taken on a build that still had a fast EWMA
-(`FastHalfLife=750ms`); that field was removed in `feat/simple-controller`, and
-the controller now compares the tick's p50 directly.
+`Tick=250ms`. These numbers come from the current controller.
+
+The simulation runs in real time, so it is not bit-reproducible: repeated runs
+move the achieved rate by about 1–2% and the final rate by a few percent, while
+the goodput figures were stable to the unit across three runs. The tables below
+report the median of three runs.
+
+Because this config sets an SLO, the controller uses the SLO anchor, where the
+window is a constant `0.8 × SLOTarget` and the latency baseline does not enter
+the decision. The baseline rise cap therefore does not affect this comparison;
+it matters for the baseline anchor, which is what `compare/sloanchor_test.go`
+and `compare/matrix_test.go` exercise.
+
+One more caveat on reading any of this as a regression signal: the harness is a
+real-time simulation with no seed, and some of its outcomes are bimodal rather
+than merely noisy. In the matrix harness the baseline-anchored arm once collapsed
+to its floor (72 goodput/s at rate 5) where the same scenario in a fresh process
+on the same commit found the operating point (132 goodput/s at rate 120). Every
+other scenario and arm matched. `compare/` needs a reproducibility pass of its
+own before a single run of it can be used to judge a change.
 
 ## Case 1 — steady but UNKNOWN capacity: 150 req/s
 
@@ -40,53 +57,54 @@ the controller now compares the tick's p50 directly.
 | uber(60)  | 63 | 63 | 100% | 34ms | 34ms | 60 |
 | uber(100) | 105 | 105 | 100% | 60ms | 61ms | 100 |
 | uber(300) | 303 | **0** | 0% | 400ms | 401ms | 300 |
-| agile     | 93 | 84 | 90% | 60ms | 144ms | 131 |
+| agile     | 97 | 88 | 91% | 85ms | 401ms | 120 |
 
 A fixed rate *has* to guess the capacity: 60 leaves more than half the capacity
 idle, 300 melts (0 goodput — every request blows the SLO), and only a lucky
 guess of 100 is excellent. agile was never told the capacity; it settles at
-~90–130 and lands **between the cautious and the well-guessed fixed rate**
-(84 vs 63 / 105), at 90% SLO compliance. It also beats the well-guessed rate on
+~97 and lands **between the cautious and the well-guessed fixed rate**
+(88 vs 63 / 105), at 91% SLO compliance. It also beats the well-guessed rate on
 one axis outright: it is the *only* row that is safe without knowing the answer.
 
 Where a fixed rate wins: if you genuinely know the capacity is 150 and it never
-moves, `uber(100)` is simpler and slightly better (105 vs 84). Adaptivity is not
+moves, `uber(100)` is simpler and slightly better (105 vs 88). Adaptivity is not
 free — it costs a sawtooth around the target and some SLO overshoot.
 
 ## Case 2 — STEP degradation: 150 -> 60 -> 30 req/s at t=2s, 4s
 
 | limiter | achieved/s | goodput/s | %<=SLO | mean | p99 | finalRate |
 |---------|-----------:|----------:|-------:|-----:|----:|----------:|
-| uber(120) | 121 | **0** | 0% | 335ms | 401ms | 120 |
+| uber(120) | 121 | **0** | 0% | 334ms | 401ms | 120 |
 | uber(24)  | 25 | 11 | 42% | 70ms | 101ms | 24 |
-| agile     | 46 | **37** | 82% | 79ms | 401ms | 22 |
+| agile     | 54 | **40** | 74% | 137ms | 401ms | 23 |
 
 No single fixed rate is good here. `uber(120)` is tuned for the healthy phase
 and melts the moment capacity drops. `uber(24)` is tuned for the *worst* phase:
-it stays safe but throws away the healthy phase entirely. agile delivers **~3.4×
-the best safe fixed rate's goodput** (37 vs 11) by tracking the step down and
-back, and its final rate (22) shows it found the 30 req/s floor on its own.
+it stays safe but throws away the healthy phase entirely. agile delivers **~3.6×
+the best safe fixed rate's goodput** (40 vs 11) by tracking the step down and
+back, and its final rate (23) shows it found the 30 req/s floor on its own.
 
 ## Case 3 — DIURNAL capacity: 100 ± 60 req/s over a 6s period
 
 | limiter | achieved/s | goodput/s | %<=SLO | mean | p99 | finalRate |
 |---------|-----------:|----------:|-------:|-----:|----:|----------:|
-| uber(80) | 84 | 53 | 64% | 161ms | 401ms | 80 |
-| uber(32) | 34 | 34 | 99% | 36ms | 100ms | 32 |
-| agile    | 63 | **58** | 92% | 55ms | 401ms | 42 |
+| uber(80) | 84 | 53 | 63% | 161ms | 401ms | 80 |
+| uber(32) | 34 | 34 | 100% | 36ms | 99ms | 32 |
+| agile    | 66 | 52 | 79% | 103ms | 401ms | 22 |
 
 The capacity oscillates between 40 and 160. `uber(80)` chases the peaks and
-melts in the troughs (64% SLO). `uber(32)` is clean but only exploits the
-troughs. agile gets the **highest goodput at 92% SLO** (58 vs 53 / 34): it rides
-the curve up and down.
+melts in the troughs (63% SLO). `uber(32)` is clean but only exploits the
+troughs. agile lands at **essentially the same goodput as the best fixed rate**
+(52 vs 53) while keeping **79% of requests inside the SLO against 63%**: it
+buys SLO compliance with throughput rather than with luck.
 
 ## Summary
 
 | capacity | best fixed rate | agile | verdict |
 |----------|----------------:|------:|---------|
-| steady, unknown 150 | 105 (a lucky guess) | 84 | fixed rate wins if you know the number |
-| step 150->60->30 | 11 (safe) | 37 | **agile 3.4×** |
-| diurnal 40..160 | 53 | 58 | **agile 1.1–1.7×** |
+| steady, unknown 150 | 105 (a lucky guess) | 88 | fixed rate wins if you know the number |
+| step 150->60->30 | 11 (safe) | 40 | **agile 3.6×** |
+| diurnal 40..160 | 53 | 52 | tie on goodput; agile keeps 79% vs 63% inside the SLO |
 
 The fixed-rate limiter answers *"pace at exactly N per second"*. That is the
 right tool when N is known and constant, and the wrong tool as soon as N moves —

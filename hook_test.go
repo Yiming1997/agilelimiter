@@ -3,6 +3,7 @@ package agilelimiter
 import (
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -313,4 +314,113 @@ func TestConcurrencyObserveRunsAfterRelease(t *testing.T) {
 	if inFlightAtHook != 0 {
 		t.Fatalf("in-flight at Observe hook = %d, want 0: the permit must be released first", inFlightAtHook)
 	}
+}
+
+// The stronger form of the same guarantee: with a limit of one, a blocked
+// Observe hook must not stop a second request from being admitted. If the slot
+// were still held, the second Do would return ErrOverloaded.
+func TestConcurrencyObserveHookDoesNotHoldPermit(t *testing.T) {
+	l := NewConcurrency(ConcurrencyConfig{MaxLimit: 1, InitialLimit: 1})
+	entered := make(chan struct{})
+	unblock := make(chan struct{})
+	var calls atomic.Int32
+	if err := l.SetHooks(&Hooks{Observe: []ObserveHook{func(Observation) {
+		if calls.Add(1) == 1 {
+			close(entered)
+			<-unblock // first request sits here with the permit already free
+		}
+	}}}); err != nil {
+		t.Fatalf("SetHooks: %v", err)
+	}
+
+	firstDone := make(chan struct{})
+	go func() {
+		_ = l.Do(func() error { return nil })
+		close(firstDone)
+	}()
+	<-entered
+
+	if err := l.Do(func() error { return nil }); err != nil {
+		t.Fatalf("second Do = %v, want nil: the permit must be free during the Observe hook", err)
+	}
+	close(unblock)
+	<-firstDone
+}
+
+// A panic in fn must still release the slot and must not run Observe hooks.
+func TestConcurrencyDoPanicReleasesSlot(t *testing.T) {
+	l := NewConcurrency(ConcurrencyConfig{MaxLimit: 2, InitialLimit: 2})
+	observed := false
+	if err := l.SetHooks(&Hooks{Observe: []ObserveHook{func(Observation) {
+		observed = true
+	}}}); err != nil {
+		t.Fatalf("SetHooks: %v", err)
+	}
+
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("Do did not propagate the panic")
+			}
+		}()
+		_ = l.Do(func() error { panic("boom") })
+	}()
+
+	if observed {
+		t.Fatal("Observe hook ran after fn panicked")
+	}
+	if got := l.InFlight(); got != 0 {
+		t.Fatalf("in-flight after panic = %d, want 0 (slot leaked)", got)
+	}
+}
+
+// A panic in an Observe hook happens after release; it must not leak or
+// double-release the slot (in-flight would be 1 or -1).
+func TestConcurrencyObservePanicKeepsAccountingSane(t *testing.T) {
+	l := NewConcurrency(ConcurrencyConfig{MaxLimit: 2, InitialLimit: 2})
+	if err := l.SetHooks(&Hooks{Observe: []ObserveHook{func(Observation) {
+		panic("hook")
+	}}}); err != nil {
+		t.Fatalf("SetHooks: %v", err)
+	}
+
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("Do did not propagate the hook panic")
+			}
+		}()
+		_ = l.Do(func() error { return nil })
+	}()
+
+	if got := l.InFlight(); got != 0 {
+		t.Fatalf("in-flight after hook panic = %d, want 0", got)
+	}
+}
+
+// A panic in Admit happens before the slot is taken: no release is owed.
+func TestConcurrencyAdmitPanicTakesNoSlot(t *testing.T) {
+	l := NewConcurrency(ConcurrencyConfig{MaxLimit: 1, InitialLimit: 1})
+	if err := l.SetHooks(&Hooks{Admit: []AdmitHook{func() error {
+		panic("admit")
+	}}}); err != nil {
+		t.Fatalf("SetHooks: %v", err)
+	}
+
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("Do did not propagate the Admit panic")
+			}
+		}()
+		_ = l.Do(func() error { return nil })
+	}()
+
+	if got := l.InFlight(); got != 0 {
+		t.Fatalf("in-flight after Admit panic = %d, want 0", got)
+	}
+	if !l.TryTake() {
+		t.Fatal("a later request cannot acquire: the Admit panic left the limiter broken")
+	}
+	l.Release()
 }

@@ -115,6 +115,7 @@ type ConcurrencyLimiter struct {
 	stopOnce  sync.Once
 	stop      chan struct{}
 	wg        sync.WaitGroup
+	hooks     *Hooks
 }
 
 // toConfig maps the concurrency bounds onto the rate config the shared
@@ -179,10 +180,35 @@ func NewConcurrency(cc ConcurrencyConfig) *ConcurrencyLimiter {
 	return l
 }
 
+// SetHooks attaches hooks that run around every Do call: Admit before a slot is
+// tried, Observe after the request has been recorded.
+//
+// It mirrors Limiter.SetHooks, with one important difference: inbound admission
+// is non-blocking on purpose, so an Admit hook should reject (return an error)
+// rather than block. A blocking Admit hook builds the queue this limiter exists
+// to avoid. Observe hooks run while the slot is still held, so they must be
+// fast, too.
+//
+// It may be called at most once, and nil is rejected. Call it before serving
+// traffic from one goroutine. TryTake is the raw actuator and does not run
+// hooks; use Do, or the httpserver middleware once it routes through it.
+func (l *ConcurrencyLimiter) SetHooks(hooks *Hooks) error {
+	if hooks == nil {
+		return errors.New("agilelimiter: nil hooks")
+	}
+	if l.hooks != nil {
+		return errors.New("agilelimiter: hooks already set")
+	}
+	l.hooks = hooks
+	return nil
+}
+
 // TryTake admits the caller if there is room under the current limit and reports
 // whether it was admitted. It never blocks: at the limit it returns false at
 // once, so an inbound caller sheds load instead of queuing. Every true result
 // must be paired with exactly one Release.
+//
+// TryTake is the raw actuator: it does not run the hooks. Do does.
 func (l *ConcurrencyLimiter) TryTake() bool { return l.sem.tryAcquire() }
 
 // Release frees one slot taken by TryTake.
@@ -230,6 +256,11 @@ func (l *ConcurrencyLimiter) ObserveTruncated(d time.Duration) {
 // handling time; classify the "failed without doing any work" errors as
 // Unreachable so they cannot pass for a fast, healthy handler.
 func (l *ConcurrencyLimiter) Do(fn func() error) error {
+	if l.hooks != nil {
+		if err := l.hooks.admit(); err != nil {
+			return err
+		}
+	}
 	if !l.sem.tryAcquire() {
 		return ErrOverloaded
 	}
@@ -241,7 +272,8 @@ func (l *ConcurrencyLimiter) Do(fn func() error) error {
 }
 
 // observeOutcome tells the controller what a request's result says about the
-// service. See Limiter.observeOutcome and Outcome.
+// service, then runs the Observe hooks with the classification it applied. See
+// Limiter.observeOutcome and Outcome.
 func (l *ConcurrencyLimiter) observeOutcome(d time.Duration, err error) {
 	out := defaultOutcome(err) // context.Canceled -> Aborted, see defaultOutcome
 	if err != nil && l.cfg.Classify != nil {
@@ -259,6 +291,9 @@ func (l *ConcurrencyLimiter) observeOutcome(d time.Duration, err error) {
 	default:
 		l.ctrl.clearProbe()
 		l.hist.record(d)
+	}
+	if l.hooks != nil {
+		l.hooks.observe(Observation{Duration: d, Err: err, Outcome: out})
 	}
 }
 

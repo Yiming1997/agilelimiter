@@ -487,6 +487,7 @@ type Limiter struct {
 	stopOnce  sync.Once
 	stop      chan struct{}
 	wg        sync.WaitGroup
+	hooks     *Hooks
 }
 
 // New builds a Limiter. It does not start the control loop; call Start (or drive
@@ -512,6 +513,29 @@ func New(cfg Config) *Limiter {
 // Take blocks until this caller is allowed to send, and returns the planned
 // send time. Use it to build a coordinated-omission-safe latency metric.
 func (l *Limiter) Take() time.Time { return l.bucket.take() }
+
+// SetHooks attaches hooks that run around every Do call: Admit before a slot is
+// taken, Observe after the call has been recorded.
+//
+// It may be called at most once, and nil is rejected. Set-once is what keeps the
+// plain pointer free of synchronization: after the first successful call the
+// field is never written again, so a concurrent Do only ever reads it. The hot
+// path is therefore a nil check per phase, not an atomic load.
+//
+// Call it before serving traffic, from one goroutine. SetHooks is not safe to
+// call concurrently with itself: two racing first calls both see nil and both
+// write. Mutating the Hooks (its slices or handlers) after it is set is also a
+// data race.
+func (l *Limiter) SetHooks(hooks *Hooks) error {
+	if hooks == nil {
+		return errors.New("agilelimiter: nil hooks")
+	}
+	if l.hooks != nil {
+		return errors.New("agilelimiter: hooks already set")
+	}
+	l.hooks = hooks
+	return nil
+}
 
 // Observe records one downstream round-trip time. Feed it the latency measured
 // from the moment the request was actually sent, NOT including this limiter's
@@ -563,6 +587,12 @@ func truncatedIsSlow(cfg Config, d time.Duration) bool {
 // reached" errors as Unreachable so a refused connection cannot masquerade as a
 // fast healthy response.
 func (l *Limiter) Do(fn func() error) error {
+	if l.hooks != nil {
+		if err := l.hooks.admit(); err != nil {
+			return err
+		}
+	}
+
 	l.Take()
 	start := l.cfg.Clock.Now()
 	err := fn()
@@ -576,6 +606,13 @@ func (l *Limiter) Do(fn func() error) error {
 //		return client.Do(req)
 //	})
 func Do[T any](l *Limiter, fn func() (T, error)) (T, error) {
+	var zero T
+	if l.hooks != nil {
+		if err := l.hooks.admit(); err != nil {
+			return zero, err
+		}
+	}
+
 	l.Take()
 	start := l.cfg.Clock.Now()
 	v, err := fn()
@@ -599,7 +636,8 @@ func defaultOutcome(err error) Outcome {
 }
 
 // observeOutcome tells the controller what a call's result says about the
-// downstream. See Outcome for why the error alone is not the question.
+// downstream, then runs the Observe hooks with the classification it applied.
+// See Outcome for why the error alone is not the question.
 func (l *Limiter) observeOutcome(d time.Duration, err error) {
 	out := defaultOutcome(err)
 	if err != nil && l.cfg.Classify != nil {
@@ -617,6 +655,9 @@ func (l *Limiter) observeOutcome(d time.Duration, err error) {
 	default:
 		l.ctrl.clearProbe()
 		l.hist.record(d)
+	}
+	if l.hooks != nil {
+		l.hooks.observe(Observation{Duration: d, Err: err, Outcome: out})
 	}
 }
 
@@ -645,7 +686,8 @@ func (l *Limiter) Unavailable() { l.ctrl.noteUnreachable() }
 // error. Use it from an integration that measures and classifies calls itself —
 // a http.RoundTripper, a gRPC interceptor — so the error policy stays in one
 // place instead of being reimplemented at every seam. It is exactly what Do does
-// with the same two values.
+// with the same two values, including the Observe hooks (if any). It does not
+// run Admit hooks: an integration that calls this did its own admission.
 func (l *Limiter) ObserveOutcome(d time.Duration, err error) { l.observeOutcome(d, err) }
 
 // Rate returns the current target rate in requests per second.

@@ -186,8 +186,9 @@ func NewConcurrency(cc ConcurrencyConfig) *ConcurrencyLimiter {
 // It mirrors Limiter.SetHooks, with one important difference: inbound admission
 // is non-blocking on purpose, so an Admit hook should reject (return an error)
 // rather than block. A blocking Admit hook builds the queue this limiter exists
-// to avoid. Observe hooks run while the slot is still held, so they must be
-// fast, too.
+// to avoid. Observe hooks run after the slot has been released, so a slow one no
+// longer holds a concurrency permit; it still runs on the caller's goroutine and
+// delays that request's return.
 //
 // It may be called at most once, and nil is rejected. Call it before serving
 // traffic from one goroutine. TryTake is the raw actuator and does not run
@@ -264,10 +265,23 @@ func (l *ConcurrencyLimiter) Do(fn func() error) error {
 	if !l.sem.tryAcquire() {
 		return ErrOverloaded
 	}
+
 	start := l.cfg.Clock.Now()
-	defer l.sem.release()
+	released := false
+	defer func() {
+		if !released {
+			l.sem.release() // only on panic; the normal path releases below
+		}
+	}()
+
 	err := fn()
-	l.observeOutcome(l.cfg.Clock.Now().Sub(start), err)
+	d := l.cfg.Clock.Now().Sub(start)
+	l.sem.release()
+	released = true
+
+	// The slot is already free, so a slow Observe hook (Prometheus, spans) no
+	// longer holds a scarce inbound permit.
+	l.observeOutcome(d, err)
 	return err
 }
 

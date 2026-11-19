@@ -16,8 +16,9 @@ import "time"
 // controller, in order. Each one receives an Observation — the measured
 // duration, the call's error, and the Outcome the controller was told — so it
 // can log, export metrics or trace without guessing. They are post-call side
-// effects and cannot change the result; they should be fast and must not block,
-// because they run on the caller's goroutine after the sample is recorded.
+// effects and cannot change the result; they run on the caller's goroutine
+// after the sample is recorded (on a ConcurrencyLimiter, after the permit is
+// released), so they should still be fast but no longer hold a slot.
 //
 // Hooks are set once, before serving traffic; SetHooks refuses a second call.
 // Because the pointer never changes after that, Do can read it without

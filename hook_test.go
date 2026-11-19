@@ -295,3 +295,22 @@ func TestConcurrencySetHooksOnlyOnce(t *testing.T) {
 		t.Fatal("second SetHooks replaced the hooks")
 	}
 }
+
+// A slow Observe hook must not hold an inbound permit: Prometheus/span export
+// used to extend in-flight by its own duration and cut effective throughput.
+func TestConcurrencyObserveRunsAfterRelease(t *testing.T) {
+	l := NewConcurrency(ConcurrencyConfig{MaxLimit: 10, InitialLimit: 10})
+	inFlightAtHook := -1
+	if err := l.SetHooks(&Hooks{Observe: []ObserveHook{func(Observation) {
+		inFlightAtHook = l.InFlight()
+	}}}); err != nil {
+		t.Fatalf("SetHooks: %v", err)
+	}
+
+	if err := l.Do(func() error { return nil }); err != nil {
+		t.Fatalf("Do returned %v", err)
+	}
+	if inFlightAtHook != 0 {
+		t.Fatalf("in-flight at Observe hook = %d, want 0: the permit must be released first", inFlightAtHook)
+	}
+}
